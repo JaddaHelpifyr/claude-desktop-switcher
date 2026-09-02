@@ -368,9 +368,17 @@ function Invoke-Failover {
 
         # If the import succeeded there are now two index entries for one
         # transcript. Drop ours; the app's is canonical.
-        Start-Sleep -Seconds 6
+        #
+        # Poll rather than sleeping once: the app has to launch, handle the URI
+        # and rewrite the transcript, which routinely takes longer than a few
+        # seconds. A single short wait reports a false "did not import" and
+        # leaves the duplicate behind.
         $tgtDir  = Join-Path $SessionsRoot $map[$target]
         $appMade = Join-Path (Join-Path $tgtDir '*') "local_$CliSessionId.json"
+        for ($w = 0; $w -lt 30; $w++) {
+            Start-Sleep -Seconds 1
+            if (Test-Path $appMade) { break }
+        }
         if (Test-Path $appMade) {
             foreach ($f in Get-ChildItem $tgtDir -Recurse -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
                 if ($f.Name -eq "local_$CliSessionId.json") { continue }
