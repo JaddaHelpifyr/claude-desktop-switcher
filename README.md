@@ -60,6 +60,39 @@ $lnk.WorkingDirectory = "$PWD"
 $lnk.Save()
 ```
 
+### Giving the shortcut the Claude icon (optional)
+
+Generate an icon file **once** from the installed package, then point the
+shortcut at that file:
+
+```powershell
+Add-Type -AssemblyName System.Drawing
+$src = Join-Path (Get-AppxPackage -Name 'Claude').InstallLocation 'assets\Square150x150Logo.scale-200.png'
+$img = [System.Drawing.Image]::FromFile($src); $out = "$PWD\claude-switcher.ico"
+$pngs = @(); foreach ($s in 256,48,32,16) {
+  $b = New-Object System.Drawing.Bitmap($s,$s); $g = [System.Drawing.Graphics]::FromImage($b)
+  $g.InterpolationMode='HighQualityBicubic'; $g.DrawImage($img,0,0,$s,$s); $g.Dispose()
+  $ms = New-Object System.IO.MemoryStream; $b.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png)
+  $pngs += ,@($s,$ms.ToArray()); $b.Dispose(); $ms.Dispose()
+}
+$img.Dispose(); $fs=[System.IO.File]::Create($out); $bw=New-Object System.IO.BinaryWriter($fs)
+$bw.Write([uint16]0);$bw.Write([uint16]1);$bw.Write([uint16]$pngs.Count); $off=6+16*$pngs.Count
+foreach($p in $pngs){ $d = if($p[0] -ge 256){0}else{$p[0]}
+  $bw.Write([byte]$d);$bw.Write([byte]$d);$bw.Write([byte]0);$bw.Write([byte]0)
+  $bw.Write([uint16]1);$bw.Write([uint16]32);$bw.Write([uint32]$p[1].Length);$bw.Write([uint32]$off);$off+=$p[1].Length }
+foreach($p in $pngs){ $bw.Write($p[1]) }; $bw.Close(); $fs.Close()
+
+$ws = New-Object -ComObject WScript.Shell
+$s = $ws.CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\Claude Account Switcher.lnk")
+$s.IconLocation = "$out,0"; $s.Save()
+```
+
+**Do not point `IconLocation` at `claude.exe` inside `Program Files\WindowsApps`.**
+That path contains the app's version number, so the next Claude update deletes it
+and the shortcut silently reverts to a blank white page icon. The generated
+`.ico` lives beside the scripts and survives updates. It is gitignored — it's
+Anthropic's artwork, so generate it locally rather than committing it.
+
 ## First run
 
 1. Open the GUI while signed into your **first** account

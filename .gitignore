@@ -10,6 +10,11 @@
 *.log
 *.tmp
 
+# The shortcut icon is generated locally from the installed Claude package
+# (see README). Not committed: it is Anthropic's artwork, and generating it
+# locally keeps it correct across app updates.
+*.ico
+
 # If anyone ever copies profile state next to the scripts by mistake
 .claude-profiles/
 *cooldowns.json
