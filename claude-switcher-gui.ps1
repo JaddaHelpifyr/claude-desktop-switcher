@@ -745,6 +745,18 @@ $tip.SetToolTip($watchBtn['test'],      'Replay past rate-limit records found in
 
 # --- Go ----------------------------------------------------------------------
 
+# Reflect what the login entry is actually configured with. Without this the
+# boxes always open on dry run, so pressing "Run on login" from a fresh window
+# would silently revert a live setup back to dry run.
+$StartupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Auto-Switch.lnk'
+if (Test-Path $StartupLnk) {
+    try {
+        $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($StartupLnk)
+        $chkDryRun.Checked   = [bool]($sc.Arguments -match '-DryRun')
+        $chkFiveHour.Checked = [bool]($sc.Arguments -match '-IncludeFiveHour')
+    } catch { }
+}
+
 Update-All
 Add-Output 'Ready. Switching and saving both close Claude briefly.'
 [void]$form.ShowDialog()
