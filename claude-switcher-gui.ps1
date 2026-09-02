@@ -389,6 +389,26 @@ $chkFiveHour.Location = New-Object System.Drawing.Point(12, 138)
 $chkFiveHour.Size     = New-Object System.Drawing.Size(400, 24)
 $tabWatcher.Controls.Add($chkFiveHour)
 
+$lblMinWait          = New-Object System.Windows.Forms.Label
+$lblMinWait.Text     = 'only if it resets more than'
+$lblMinWait.Location = New-Object System.Drawing.Point(418, 142)
+$lblMinWait.Size     = New-Object System.Drawing.Size(158, 20)
+$tabWatcher.Controls.Add($lblMinWait)
+
+$numMinWait          = New-Object System.Windows.Forms.NumericUpDown
+$numMinWait.Location = New-Object System.Drawing.Point(578, 138)
+$numMinWait.Size     = New-Object System.Drawing.Size(54, 24)
+$numMinWait.Minimum  = 0
+$numMinWait.Maximum  = 300
+$numMinWait.Value    = 30
+$tabWatcher.Controls.Add($numMinWait)
+
+$lblMinWait2          = New-Object System.Windows.Forms.Label
+$lblMinWait2.Text     = 'min away'
+$lblMinWait2.Location = New-Object System.Drawing.Point(636, 142)
+$lblMinWait2.Size     = New-Object System.Drawing.Size(70, 20)
+$tabWatcher.Controls.Add($lblMinWait2)
+
 $watchButtons = @(
     @{ Text = 'Start watcher';        X = 12;  Y = 176; Name = 'start'    },
     @{ Text = 'Stop watcher';         X = 176; Y = 176; Name = 'stop'     },
@@ -676,7 +696,7 @@ $watchBtn['start'].Add_Click({
     }
     $a = @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$AutoScript,'run')
     if ($chkDryRun.Checked)   { $a += '-DryRun' }
-    if ($chkFiveHour.Checked) { $a += '-IncludeFiveHour' }
+    if ($chkFiveHour.Checked) { $a += '-IncludeFiveHour'; $a += '-MinFiveHourWaitMinutes'; $a += [string][int]$numMinWait.Value }
     Start-Process powershell.exe -ArgumentList $a
     Add-Output 'Started watcher (hidden).'
     Start-Sleep -Milliseconds 1200
@@ -691,7 +711,7 @@ $watchBtn['stop'].Add_Click({
 $watchBtn['install'].Add_Click({
     $n = @{}
     if ($chkDryRun.Checked)   { $n['DryRun'] = $true }
-    if ($chkFiveHour.Checked) { $n['IncludeFiveHour'] = $true }
+    if ($chkFiveHour.Checked) { $n['IncludeFiveHour'] = $true; $n['MinFiveHourWaitMinutes'] = [int]$numMinWait.Value }
     Invoke-Tool $AutoScript @('install-startup') $n
 })
 
@@ -734,6 +754,7 @@ $tip.SetToolTip($lvSessions,     "Sessions belonging to the chosen account. 'MIS
 
 $tip.SetToolTip($chkDryRun,   'Detect and log rate limits but never actually switch. Leave this on until you have seen it fire correctly once.')
 $tip.SetToolTip($chkFiveHour, "Also fail over on 5-hour limits.`nOff by default: it spends the other account's WEEKLY budget to skip a few hours' wait.")
+$tip.SetToolTip($numMinWait,  "Only switch on a 5-hour limit if its reset is at least this many minutes away.`nA limit that clears in 10 minutes is cheaper to wait out. Default 30.")
 
 $tip.SetToolTip($watchBtn['start'],     'Start the watcher now, hidden, using the checkboxes above. Only one can run at a time.')
 $tip.SetToolTip($watchBtn['stop'],      'Stop the running watcher, including one that was started at login.')
@@ -754,6 +775,7 @@ if (Test-Path $StartupLnk) {
         $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($StartupLnk)
         $chkDryRun.Checked   = [bool]($sc.Arguments -match '-DryRun')
         $chkFiveHour.Checked = [bool]($sc.Arguments -match '-IncludeFiveHour')
+        if ($sc.Arguments -match '-MinFiveHourWaitMinutes\s+(\d+)') { $numMinWait.Value = [int]$Matches[1] }
     } catch { }
 }
 

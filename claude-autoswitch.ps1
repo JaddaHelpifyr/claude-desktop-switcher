@@ -45,7 +45,12 @@ param(
 
     [int]$IntervalSeconds = 5,
     [switch]$DryRun,
-    [switch]$IncludeFiveHour
+    [switch]$IncludeFiveHour,
+
+    # With -IncludeFiveHour: only switch if the 5-hour window resets further
+    # away than this. A limit that clears in ten minutes is not worth spending
+    # the other account's WEEKLY budget on.
+    [int]$MinFiveHourWaitMinutes = 30
 )
 
 $ErrorActionPreference = 'Stop'
@@ -96,6 +101,27 @@ function Write-Log {
     $stamp = (Get-Date).ToString('MM-dd HH:mm:ss')
     Write-Host "  [$stamp] $Message" -ForegroundColor $Color
     try { Add-Content -Path $LogFile -Value "[$stamp] $Message" -Encoding utf8 } catch { }
+}
+
+# Windows toast. The watcher runs hidden and the app just closes mid-turn when
+# it switches, so without this the only explanation of what happened is a log
+# file. Uses PowerShell's own registered AppUserModelId, which lets an
+# unpackaged script raise toasts without registering one of its own.
+function Show-Toast {
+    param([string]$Title, [string]$Body)
+    try {
+        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+        $t = [System.Security.SecurityElement]::Escape($Title)
+        $b = [System.Security.SecurityElement]::Escape($Body)
+        $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $doc.LoadXml("<toast><visual><binding template='ToastGeneric'><text>$t</text><text>$b</text></binding></visual></toast>")
+        $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show(
+            (New-Object Windows.UI.Notifications.ToastNotification $doc))
+    } catch {
+        Write-Log "  (toast unavailable: $($_.Exception.Message))" 'DarkGray'
+    }
 }
 
 # --- Identity ----------------------------------------------------------------
@@ -149,6 +175,14 @@ function Set-Cooldowns {
     # WriteAllText, not Set-Content -Encoding utf8: the latter emits a BOM, which
     # PowerShell tolerates on read but anything else parsing this file does not.
     [System.IO.File]::WriteAllText($StateFile, ($Map | ConvertTo-Json -Depth 3))
+}
+
+function Register-Cooldown {
+    param([string]$Uuid, [int64]$ResetsAt, [string]$LimitType)
+    $cool = Get-Cooldowns
+    $cool[$Uuid] = $ResetsAt
+    Set-Cooldowns $cool
+    Write-Log "$LimitType limit hit on $($Uuid.Substring(0,8))... - cooling down until $(Format-Epoch $ResetsAt)" 'Yellow'
 }
 
 function Get-NowEpoch { return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
@@ -206,10 +240,8 @@ function Invoke-Failover {
     $liveUuid = Get-LiveAccountUuid
     if (-not $liveUuid) { Write-Log "Cannot read the live account UUID - skipping." 'Red'; return }
 
+    Register-Cooldown -Uuid $liveUuid -ResetsAt $ResetsAt -LimitType $LimitType
     $cool = Get-Cooldowns
-    $cool[$liveUuid] = $ResetsAt
-    Set-Cooldowns $cool
-    Write-Log "$LimitType limit hit on $($liveUuid.Substring(0,8))... - cooling down until $(Format-Epoch $ResetsAt)" 'Yellow'
 
     $now = Get-NowEpoch
     $map = Get-ProfileMap
@@ -226,32 +258,68 @@ function Invoke-Failover {
 
     if (-not $target) {
         Write-Log "No account available - every profile is rate limited. Still watching." 'Red'
+        $soonest = ($cool.Values | Where-Object { $_ -gt $now } | Sort-Object | Select-Object -First 1)
+        Show-Toast 'Claude: every account is rate limited' "Nothing to switch to. Earliest reset: $(Format-Epoch $soonest)."
         return
     }
 
     if ($DryRun) {
         Write-Log "DRY RUN: would switch to '$target' ($(Get-ProfileLabel $target))" 'Cyan'
+        Show-Toast 'Claude switcher (dry run)' "$LimitType limit hit. Would have switched to $(Get-ProfileLabel $target)."
         return
     }
 
+    # Belt: make the session visible on the target account by copying its index
+    # entry, so it is there even if the app's own import below refuses.
     $result = Copy-SessionToAccount -CliSessionId $CliSessionId -FromUuid $liveUuid -ToUuid $map[$target]
     Write-Log "  session: $result"
 
     Write-Log "Switching to '$target' ($(Get-ProfileLabel $target))..." 'Cyan'
-    & $ProfileScript switch $target
+    & $ProfileScript switch $target -NoLaunch
 
     # Do NOT test $LASTEXITCODE here: claude-profile.ps1 only calls exit on
     # failure, so on success it stays null and '-eq 0' reports a false failure.
     # Ask the app which account it is actually on instead.
     Start-Sleep -Milliseconds 800
     $nowUuid = Get-LiveAccountUuid
-    if ($nowUuid -and $nowUuid -eq $map[$target]) {
-        Write-Log "Switched to $(Get-ProfileLabel $target). Re-send your last message in the relaunched app." 'Green'
-    } elseif ($nowUuid -eq $liveUuid) {
-        Write-Log "Switch did not take - still on the limited account." 'Red'
-    } else {
-        Write-Log "Switch finished but the account reads as $nowUuid - check with 'status'." 'Yellow'
+    if ($nowUuid -ne $map[$target]) {
+        if ($nowUuid -eq $liveUuid) { Write-Log "Switch did not take - still on the limited account." 'Red' }
+        else { Write-Log "Switch finished but the account reads as $nowUuid - check with 'status'." 'Yellow' }
+        Show-Toast 'Claude switcher: switch failed' 'Still on the rate-limited account. See autoswitch.log.'
+        Start-Process ('shell:AppsFolder\' + (Get-ClaudeAumid))
+        return
     }
+
+    # Braces: relaunch through the app's own resume deep link so it opens
+    # straight into the conversation instead of the session list. Verified in
+    # the app bundle: claude://resume?session=<cliSessionId> -> importCliSession.
+    # It rewrites the transcript (keeping a .pre-import copy) and files the
+    # session as local_<cliSessionId>.
+    Write-Log "  relaunching into the session via claude://resume" 'DarkGray'
+    Start-Process "claude://resume?session=$CliSessionId"
+
+    # If the import succeeded there are now two index entries for one transcript.
+    # Drop ours; the app's is the canonical one.
+    Start-Sleep -Seconds 6
+    $tgtDir  = Join-Path $SessionsRoot $map[$target]
+    $appMade = Join-Path (Join-Path $tgtDir '*') "local_$CliSessionId.json"
+    if (Test-Path $appMade) {
+        foreach ($f in Get-ChildItem $tgtDir -Recurse -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
+            if ($f.Name -eq "local_$CliSessionId.json") { continue }
+            try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+            if ($j.cliSessionId -eq $CliSessionId) {
+                Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
+                Write-Log "  app imported the session itself; removed duplicate $($f.Name)" 'DarkGray'
+            }
+        }
+    } else {
+        Write-Log "  app did not import via deep link; the copied entry stands (find it in the session list)" 'DarkGray'
+    }
+
+    $fromName = ($map.Keys | Where-Object { $map[$_] -eq $liveUuid } | Select-Object -First 1)
+    $fromLabel = if ($fromName) { Get-ProfileLabel $fromName } else { $liveUuid.Substring(0,8) + '...' }
+    Write-Log "Switched to $(Get-ProfileLabel $target). Re-send your last message." 'Green'
+    Show-Toast "Claude: switched to $(Get-ProfileLabel $target)" "$LimitType limit on $fromLabel. Re-send your last message."
 }
 
 # --- Transcript tailing ------------------------------------------------------
@@ -305,6 +373,20 @@ function Test-QuotaLine {
         return
     }
     if (-not $q.resetsAt) { Write-Log "Rejection had no resetsAt - schema may have changed." 'Red'; return }
+
+    # A five-hour limit that clears soon is cheaper to wait out than to dodge:
+    # switching spends the other account's WEEKLY budget. Record the cooldown so
+    # 'status' shows it, but stay put.
+    if ($type -eq 'five_hour') {
+        $mins = [int](([int64]$q.resetsAt - (Get-NowEpoch)) / 60)
+        if ($mins -lt $MinFiveHourWaitMinutes) {
+            $live = Get-LiveAccountUuid
+            if ($live) { Register-Cooldown -Uuid $live -ResetsAt ([int64]$q.resetsAt) -LimitType $type }
+            Write-Log "  resets in $mins min (< $MinFiveHourWaitMinutes) - waiting rather than spending the other account's weekly budget." 'Yellow'
+            Show-Toast 'Claude: 5-hour limit reached' "Resets in $mins min. Not switching - too short to be worth the other account's weekly budget."
+            return
+        }
+    }
 
     Invoke-Failover -CliSessionId $CliSessionId -ResetsAt ([int64]$q.resetsAt) -LimitType $type
 }
@@ -413,6 +495,7 @@ switch ($Command) {
         $a = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" run"
         if ($DryRun)          { $a += ' -DryRun' }
         if ($IncludeFiveHour) { $a += ' -IncludeFiveHour' }
+        if ($IncludeFiveHour -and $MinFiveHourWaitMinutes -ne 30) { $a += " -MinFiveHourWaitMinutes $MinFiveHourWaitMinutes" }
         if ($IntervalSeconds -ne 5) { $a += " -IntervalSeconds $IntervalSeconds" }
 
         $sc.Arguments        = $a

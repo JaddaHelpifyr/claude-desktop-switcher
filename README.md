@@ -77,9 +77,24 @@ On the **Auto-switch** tab:
 - **Dry run** — detect and log, never switch. *Leave this on until you've seen it
   fire correctly once.*
 - **Also switch on 5-hour limits** — off by default; it spends the other
-  account's weekly budget to skip a few hours' wait
+  account's weekly budget to skip a wait. When on, it only switches if the
+  window resets more than **N minutes** away (default 30) — a limit that clears
+  in ten minutes is cheaper to wait out.
 - **Start watcher** / **Stop watcher** — run it now
 - **Run on login** — install a Startup entry so it runs hidden at every login
+
+When a limit is hit, the watcher:
+
+1. records the account's cooldown from `resetsAt`
+2. copies the session's index entry to the other account
+3. switches profiles (Claude closes)
+4. relaunches through `claude://resume?session=<id>`, so the app opens straight
+   into the conversation, then drops the copied entry if the app's own import
+   succeeded
+5. raises a Windows toast saying what happened and which account you're on now
+
+The turn that hit the limit is lost — re-send it. If every account is limited it
+stays put and toasts the earliest reset time.
 
 Everything it sees goes to `%USERPROFILE%\.claude-profiles\autoswitch.log`.
 
@@ -162,9 +177,9 @@ The GUI covers everything, but each script runs standalone:
 .\claude-sessions.ps1 copy <sessionId> <account>
 
 .\claude-autoswitch.ps1 status|test|reset
-.\claude-autoswitch.ps1 run [-DryRun] [-IncludeFiveHour]
+.\claude-autoswitch.ps1 run [-DryRun] [-IncludeFiveHour] [-MinFiveHourWaitMinutes N]
 .\claude-autoswitch.ps1 stop
-.\claude-autoswitch.ps1 install-startup [-DryRun] [-IncludeFiveHour]
+.\claude-autoswitch.ps1 install-startup [-DryRun] [-IncludeFiveHour] [-MinFiveHourWaitMinutes N]
 .\claude-autoswitch.ps1 uninstall-startup
 ```
 
