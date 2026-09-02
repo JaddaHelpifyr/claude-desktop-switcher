@@ -98,6 +98,53 @@ stays put and toasts the earliest reset time.
 
 Everything it sees goes to `%USERPROFILE%\.claude-profiles\autoswitch.log`.
 
+### Start it from the shortcut, not from inside Claude
+
+Launch the watcher from the **GUI's Start button**, the **Desktop shortcut**, or the
+**login entry** — never from a shell hosted inside the Claude app itself.
+
+A switch force-kills every `claude.exe` process. Anything launched *from* a
+session inside Claude is owned by that session, so the switch can take the
+watcher (or the GUI) down with it. The symptom is confusing: the app comes back
+on the new account and looks fine, but the watcher is silently gone and nothing
+is logged, because it was killed rather than exiting.
+
+To check what owns a running watcher:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+  Where-Object { $_.CommandLine -like '*claude-autoswitch*' } |
+  Select-Object ProcessId, ParentProcessId, CreationDate
+```
+
+A healthy watcher's parent is `explorer` (Desktop/login shortcut) or the GUI —
+not `claude`.
+
+### Reading the log
+
+| Line | Meaning |
+|---|---|
+| `Watching N transcript(s). Live account: <uuid>` | a watcher **started**. `N` should be > 0 — `Watching 0` means it started blind |
+| `alive - watching N transcript(s), on <uuid>` | heartbeat, every 30 min. Also the easiest way to see an account change |
+| `New transcript: <file>` | a session created after the watcher started |
+| `<type> limit hit on <uuid>... - cooling down until <time>` | a genuine rejection was detected |
+| `DRY RUN: would switch to ...` | detected but not acting (dry run) |
+| `Switched to <account>. Re-send your last message.` | failover completed |
+| `resets in N min (< M) - waiting ...` | five-hour limit too short to be worth switching |
+| `POSSIBLE FORMAT CHANGE ...` | a Claude API-error record no longer matches the known shape — run `selftest` |
+| `watch-loop error (continuing): ...` | a transient error was survived, not fatal |
+| `The switcher scripts changed on disk ...` | the running watcher is on stale code; restart it |
+
+A gap in the heartbeats with no other line means the watcher was **killed**
+(see above) rather than failing — it always logs its own errors.
+
+To confirm a switch actually landed, don't rely on the log alone:
+
+```powershell
+.\claude-profile.ps1 whoami          # live account + matching profile
+.\claude-profile.ps1 doctor          # paths, and any pending repair
+```
+
 ## How it works
 
 Your login lives in six places. Switching accounts swaps all six and restarts
