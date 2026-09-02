@@ -1,0 +1,22 @@
+# Nothing this tool produces belongs in the repo.
+#
+# Profiles, cooldown state and the watcher log all live under
+# %USERPROFILE%\.claude-profiles\ and never appear here. Saved profiles contain
+# real session credentials and are DPAPI-encrypted to a single Windows user, so
+# they are neither shareable nor useful to anyone else -- do not add them.
+
+# Local shortcuts and scratch
+*.lnk
+*.log
+*.tmp
+
+# If anyone ever copies profile state next to the scripts by mistake
+.claude-profiles/
+*cooldowns.json
+autoswitch.log
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
