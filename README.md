@@ -119,7 +119,10 @@ On the **Auto-switch** tab:
 When a limit is hit, the watcher:
 
 1. records the account's cooldown from `resetsAt`
-2. copies the session's index entry to the other account
+2. copies **every session you were working in** to the other account — not just
+   the one that made the rejected request. A rate limit blocks the whole
+   account, so any session touched in the last `-CarryOverMinutes` (default 60)
+   comes across; the session that triggered the limit is always included
 3. switches profiles (Claude closes)
 4. relaunches through `claude://resume?session=<id>`, so the app opens straight
    into the conversation, then drops the copied entry if the app's own import
@@ -290,9 +293,9 @@ The GUI covers everything, but each script runs standalone:
 .\claude-sessions.ps1 copy <sessionId> <account>
 
 .\claude-autoswitch.ps1 status|test|selftest|reset
-.\claude-autoswitch.ps1 run [-DryRun] [-IncludeFiveHour] [-MinFiveHourWaitMinutes N]
+.\claude-autoswitch.ps1 run [-DryRun] [-IncludeFiveHour] [-MinFiveHourWaitMinutes N] [-CarryOverMinutes N]
 .\claude-autoswitch.ps1 stop
-.\claude-autoswitch.ps1 install-startup [-DryRun] [-IncludeFiveHour] [-MinFiveHourWaitMinutes N]
+.\claude-autoswitch.ps1 install-startup [-DryRun] [-IncludeFiveHour] [-MinFiveHourWaitMinutes N] [-CarryOverMinutes N]
 .\claude-autoswitch.ps1 uninstall-startup
 ```
 

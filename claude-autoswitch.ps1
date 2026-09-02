@@ -50,7 +50,12 @@ param(
     # With -IncludeFiveHour: only switch if the 5-hour window resets further
     # away than this. A limit that clears in ten minutes is not worth spending
     # the other account's WEEKLY budget on.
-    [int]$MinFiveHourWaitMinutes = 30
+    [int]$MinFiveHourWaitMinutes = 30,
+
+    # A rate limit blocks the whole account, so every session you were working in
+    # is stuck. On failover, carry over every session touched within this many
+    # minutes -- not just the one that made the rejected request.
+    [int]$CarryOverMinutes = 60
 )
 
 # Above this transcript size, skip the resume deep link (which rewrites the file
@@ -217,38 +222,65 @@ function Format-Epoch {
 # The transcript filename IS the cliSessionId, so it maps back to the app's
 # index entry. Copying that entry makes the conversation resumable on the other
 # account; the .jsonl itself is already shared between both.
-function Copy-SessionToAccount {
-    param([string]$CliSessionId, [string]$FromUuid, [string]$ToUuid)
-
-    $srcFile = $null
-    $srcDir  = Join-Path $SessionsRoot $FromUuid
-    if (Test-Path $srcDir) {
-        foreach ($orgDir in Get-ChildItem $srcDir -Directory -ErrorAction SilentlyContinue) {
-            foreach ($f in Get-ChildItem $orgDir.FullName -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
-                try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
-                if ($j.cliSessionId -eq $CliSessionId) { $srcFile = $f; break }
-            }
-            if ($srcFile) { break }
-        }
-    }
-    if (-not $srcFile) { return "no index entry for cliSessionId $CliSessionId" }
-
+# The org folder that already holds the target account's sessions.
+function Get-TargetOrgDir {
+    param([string]$ToUuid)
     $dstAcct = Join-Path $SessionsRoot $ToUuid
-    if (-not (Test-Path $dstAcct)) { return "target account has no session folder yet" }
-
-    # Use the org folder that already holds that account's sessions.
+    if (-not (Test-Path $dstAcct)) { return $null }
     $best = $null; $bestCount = -1
     foreach ($orgDir in Get-ChildItem $dstAcct -Directory -ErrorAction SilentlyContinue) {
         $n = @(Get-ChildItem $orgDir.FullName -Filter 'local_*.json' -ErrorAction SilentlyContinue).Count
         if ($n -gt $bestCount) { $bestCount = $n; $best = $orgDir }
     }
-    if (-not $best) { return "cannot determine target org folder" }
+    return $best
+}
 
-    $dstFile = Join-Path $best.FullName $srcFile.Name
-    if (Test-Path $dstFile) { return "already present on target account" }
+function Get-AccountSessionFiles {
+    param([string]$Uuid)
+    $out = @()
+    $dir = Join-Path $SessionsRoot $Uuid
+    if (-not (Test-Path $dir)) { return $out }
+    foreach ($orgDir in Get-ChildItem $dir -Directory -ErrorAction SilentlyContinue) {
+        foreach ($f in Get-ChildItem $orgDir.FullName -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
+            try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+            $out += [pscustomobject]@{ File = $f; Json = $j }
+        }
+    }
+    return $out
+}
 
-    Copy-Item $srcFile.FullName $dstFile -Force
-    return "copied as $($srcFile.Name)"
+# A rate limit is ACCOUNT-wide, so every session being worked on is blocked --
+# not just the one that happened to make the rejected request. Carry over each
+# session with recent activity so parallel work survives the switch. The session
+# that triggered the limit is always included, however old its timestamp looks.
+function Copy-ActiveSessionsToAccount {
+    param([string]$FromUuid, [string]$ToUuid, [string]$AlwaysIncludeCliId, [int]$Minutes)
+
+    $dstOrg = Get-TargetOrgDir -ToUuid $ToUuid
+    if (-not $dstOrg) {
+        return [pscustomobject]@{ Copied = 0; Skipped = 0; Titles = @(); Error = 'target account has no session folder yet' }
+    }
+
+    $cutoff  = [DateTimeOffset]::UtcNow.AddMinutes(-$Minutes).ToUnixTimeMilliseconds()
+    $copied  = 0; $skipped = 0; $titles = @()
+
+    foreach ($s in Get-AccountSessionFiles -Uuid $FromUuid) {
+        $isTrigger = ($AlwaysIncludeCliId -and $s.Json.cliSessionId -eq $AlwaysIncludeCliId)
+        if (-not $isTrigger) {
+            $la = $s.Json.lastActivityAt
+            if (-not $la -or [int64]$la -lt $cutoff) { continue }
+        }
+        $dstFile = Join-Path $dstOrg.FullName $s.File.Name
+        if (Test-Path $dstFile) { $skipped++; continue }
+        try {
+            Copy-Item $s.File.FullName $dstFile -Force
+            $copied++
+            $t = $s.Json.title
+            if (-not $t) { $t = $s.Json.cliSessionId }
+            $titles += $t
+        } catch { }
+    }
+    return [pscustomobject]@{ Copied = $copied; Skipped = $skipped; Titles = $titles; Error = $null }
 }
 
 # --- Failover ----------------------------------------------------------------
@@ -288,10 +320,16 @@ function Invoke-Failover {
         return
     }
 
-    # Belt: make the session visible on the target account by copying its index
-    # entry, so it is there even if the app's own import below refuses.
-    $result = Copy-SessionToAccount -CliSessionId $CliSessionId -FromUuid $liveUuid -ToUuid $map[$target]
-    Write-Log "  session: $result"
+    # Belt: make the sessions visible on the target account by copying their index
+    # entries, so they are there even if the app's own import below refuses.
+    $carry = Copy-ActiveSessionsToAccount -FromUuid $liveUuid -ToUuid $map[$target] `
+                 -AlwaysIncludeCliId $CliSessionId -Minutes $CarryOverMinutes
+    if ($carry.Error) {
+        Write-Log "  sessions: $($carry.Error)" 'Red'
+    } else {
+        Write-Log "  sessions: carried $($carry.Copied) active session(s) from the last $CarryOverMinutes min ($($carry.Skipped) already there)"
+        foreach ($t in $carry.Titles) { Write-Log "    + $t" 'DarkGray' }
+    }
 
     Write-Log "Switching to '$target' ($(Get-ProfileLabel $target))..." 'Cyan'
     & $ProfileScript switch $target -NoLaunch
@@ -363,7 +401,11 @@ function Invoke-Failover {
 
     if ($held) {
         Write-Log "Switched to $(Get-ProfileLabel $target). Re-send your last message." 'Green'
-        Show-Toast "Claude: switched to $(Get-ProfileLabel $target)" "$LimitType limit on $fromLabel. Re-send your last message."
+        $extra = ''
+        if ($carry -and -not $carry.Error -and $carry.Copied -gt 1) {
+            $extra = " $($carry.Copied) active sessions carried over."
+        }
+        Show-Toast "Claude: switched to $(Get-ProfileLabel $target)" "$LimitType limit on $fromLabel. Re-send your last message.$extra"
     } else {
         # Do not spend more accounts chasing this - the profile may be signed out.
         Write-Log "Switched, but could not confirm $(Get-ProfileLabel $target) stayed signed in - its saved session may have expired. Re-save that profile while signed into it." 'Red'
@@ -697,6 +739,7 @@ switch ($Command) {
         if ($DryRun)          { $a += ' -DryRun' }
         if ($IncludeFiveHour) { $a += ' -IncludeFiveHour' }
         if ($IncludeFiveHour -and $MinFiveHourWaitMinutes -ne 30) { $a += " -MinFiveHourWaitMinutes $MinFiveHourWaitMinutes" }
+        if ($CarryOverMinutes -ne 60) { $a += " -CarryOverMinutes $CarryOverMinutes" }
         if ($IntervalSeconds -ne 5) { $a += " -IntervalSeconds $IntervalSeconds" }
 
         $sc.Arguments        = $a
