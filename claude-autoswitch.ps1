@@ -75,6 +75,17 @@ function Get-ClaudePackageFamily {
     return 'Claude_pzs8sxrjxfjjc'   # last-known default
 }
 
+# Was called on the switch-failed and large-transcript relaunch paths but never
+# defined here (only in claude-profile.ps1 / the GUI), so with -EA Stop the
+# watcher crashed exactly when a switch failed or a big session resumed.
+function Get-ClaudeAumid {
+    try {
+        $a = @(Get-StartApps -ErrorAction Stop | Where-Object { $_.Name -eq 'Claude' })
+        if ($a.Count -gt 0) { return $a[0].AppID }
+    } catch { }
+    return ((Get-ClaudePackageFamily) + '!Claude')
+}
+
 function Resolve-AppRoot {
     $fam = Get-ClaudePackageFamily
     $candidates = @(
@@ -404,31 +415,76 @@ function Read-NewLines {
     return $Offset + [System.Text.Encoding]::UTF8.GetByteCount($complete)
 }
 
-# Detect the case where Anthropic changes the rejection record: the watcher would
-# otherwise go silent and look healthy. If a line carries strong rate-limit
-# markers but does NOT match the shape we know, warn once so the failure is
-# visible instead of invisible.
+# PROVENANCE. The watcher must act only on a genuine rate-limit record that
+# Claude Code itself wrote for THIS session -- never on rate-limit-shaped text
+# that merely appears inside a transcript (a pasted example, a quoted document,
+# another session's content). A real record (verified against live transcripts)
+# is a TOP-LEVEL object carrying:
+#   isApiErrorMessage = true         (Claude Code's own API-error flag)
+#   sessionId         = <this file>  (binds the record to the transcript it lives in)
+#   quotaLimits       = { status, rateLimitType, resetsAt, ... }
+# Quoted/injected content fails the top-level check (quotaLimits ends up nested
+# inside message text, not a top-level key) and, even if forged top-level, cannot
+# carry a sessionId matching the file Claude Code is writing.
+function Get-RealRejection {
+    param([string]$Line, [string]$CliSessionId)
+
+    if ($Line -notlike '*"quotaLimits"*') { return $null }
+    try { $o = $Line | ConvertFrom-Json } catch { return $null }
+    if ($o -isnot [psobject]) { return $null }
+
+    $q = $o.quotaLimits
+    if (-not $q -or -not $q.status) { return $null }                 # quotaLimits must be a real top-level object
+    if ($o.isApiErrorMessage -ne $true) { return $null }             # Claude Code's own error record, not arbitrary content
+    if (-not $o.sessionId -or $o.sessionId -ne $CliSessionId) { return $null }  # bound to THIS transcript file
+    if (-not $q.rateLimitType -or -not $q.resetsAt) { return $null } # full expected shape
+
+    # Freshness: a real in-flight rejection is written now. Ignore stale records
+    # surfaced by a re-read/rewrite of an old transcript (using the record's own
+    # timestamp, which survives file rewrites).
+    if ($o.timestamp) {
+        try {
+            $age = ([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse($o.timestamp)).TotalMinutes
+            if ($age -gt 15) { return $null }
+        } catch { }
+    }
+    return $o
+}
+
+# Detect a rejection record whose SHAPE we no longer recognise (an app update
+# changing the schema) so detection can't go silently blind. Only fires on
+# genuine top-level API-error records -- never on rate-limit text quoted inside a
+# message -- so it does not false-warn on ordinary content.
 $script:DriftWarned = $false
 function Test-FormatDrift {
     param([string]$Line)
     if ($script:DriftWarned) { return }
-    if ($Line -notmatch 'rateLimitType|resets_at|"resetsAt"|rate_limit_error|usage limit reached') { return }
-    # Known-good shape? Then it is not drift.
-    if ($Line -like '*"quotaLimits"*') {
-        try { if (($Line | ConvertFrom-Json).quotaLimits.status) { return } } catch { }
-    }
+    try { $o = $Line | ConvertFrom-Json } catch { return }
+    if ($o -isnot [psobject]) { return }
+    # A real API-error record we failed to parse as a known rejection?
+    $looksApiError = ($o.isApiErrorMessage -eq $true) -or ($null -ne $o.quotaLimits) -or ($null -ne $o.apiErrorStatus)
+    if (-not $looksApiError) { return }
+    if ($o.quotaLimits -and $o.quotaLimits.status -and $o.quotaLimits.rateLimitType) { return }  # known-good shape
     $script:DriftWarned = $true
-    Write-Log "POSSIBLE FORMAT CHANGE: saw a rate-limit-shaped line the watcher does not recognise. Detection may be broken - check for an update." 'Red'
-    Show-Toast 'Claude switcher: possible format change' 'A rate-limit line was not recognised. Auto-switch may no longer detect limits.'
+    Write-Log "POSSIBLE FORMAT CHANGE: a Claude API-error record did not match the known rate-limit shape. Detection may be broken - run selftest / check for an update." 'Red'
+    Show-Toast 'Claude switcher: possible format change' 'A rate-limit record was not recognised. Auto-switch may no longer detect limits.'
 }
+
+# Rejections already acted on, so a re-read or resume-rewritten transcript cannot
+# re-fire and flip-flop accounts. Keyed by session + window + reset time.
+$script:HandledRejections = @{}
 
 function Test-QuotaLine {
     param([string]$Line, [string]$CliSessionId)
 
-    if ($Line -notlike '*"quotaLimits"*') { Test-FormatDrift -Line $Line; return }
-    try { $o = $Line | ConvertFrom-Json } catch { return }
+    $o = Get-RealRejection -Line $Line -CliSessionId $CliSessionId
+    if (-not $o) { Test-FormatDrift -Line $Line; return }
     $q = $o.quotaLimits
-    if (-not $q -or $q.status -ne 'rejected') { return }
+    if ($q.status -ne 'rejected') { return }
+
+    $sig = "$CliSessionId|$($q.rateLimitType)|$($q.resetsAt)"
+    if ($script:HandledRejections.ContainsKey($sig)) { return }
+    $script:HandledRejections[$sig] = $true
 
     $type = $q.rateLimitType
     if ($type -ne 'seven_day' -and -not ($IncludeFiveHour -and $type -eq 'five_hour')) {
@@ -508,31 +564,64 @@ switch ($Command) {
             else       { $script:stFail++; Write-Host "  FAIL  $label" -ForegroundColor Red }
         }
         Write-Host ""
+        $sid = 'selftest'
+        $ts  = ([DateTimeOffset]::UtcNow).ToString('o')   # fresh timestamp
+        # A realistic record carries isApiErrorMessage + sessionId + timestamp.
+        function Rec($status, $type, $resetsAt, $session = $sid, $stamp = $ts) {
+            '{"type":"assistant","isApiErrorMessage":true,"sessionId":"' + $session +
+            '","timestamp":"' + $stamp + '","quotaLimits":{"status":"' + $status +
+            '","rateLimitType":"' + $type + '","resetsAt":' + $resetsAt + '}}'
+        }
 
-        # seven_day rejection -> should record a cooldown for the live account
-        $DryRun = $true
-        Test-QuotaLine -Line ('{"quotaLimits":{"status":"rejected","resetsAt":' + ($now+86400) + ',"rateLimitType":"seven_day"}}') -CliSessionId 'selftest'
-        Check "seven_day rejection recorded a cooldown" ((Test-Path $StateFile) -and ((Get-Content $StateFile -Raw) -match '\d{10}'))
+        # genuine seven_day rejection for THIS session -> records a cooldown
+        $DryRun = $true; $IncludeFiveHour = $true
+        $script:HandledRejections = @{}
+        Test-QuotaLine -Line (Rec 'rejected' 'seven_day' ($now+86400)) -CliSessionId $sid
+        Check "genuine seven_day rejection recorded a cooldown" ((Test-Path $StateFile) -and ((Get-Content $StateFile -Raw) -match '\d{10}'))
 
-        # five_hour under the wait floor -> recorded but no failover attempt
+        # PROVENANCE: rate-limit JSON quoted inside a message must be IGNORED
         Remove-Item $StateFile -Force -ErrorAction SilentlyContinue
-        $IncludeFiveHour = $true
-        Test-QuotaLine -Line ('{"quotaLimits":{"status":"rejected","resetsAt":' + ($now+300) + ',"rateLimitType":"five_hour"}}') -CliSessionId 'selftest'
+        $script:HandledRejections = @{}
+        $injected = '{"type":"user","sessionId":"' + $sid + '","timestamp":"' + $ts +
+                    '","message":{"content":[{"type":"text","text":"example: {\"quotaLimits\":{\"status\":\"rejected\",\"rateLimitType\":\"seven_day\",\"resetsAt\":' + ($now+86400) + '}}"}]}}'
+        Test-QuotaLine -Line $injected -CliSessionId $sid
+        Check "quoted rate-limit text in a message is ignored (no cooldown)" (-not (Test-Path $StateFile))
+
+        # PROVENANCE: a real-shaped record whose sessionId is a DIFFERENT session -> ignored
+        Test-QuotaLine -Line (Rec 'rejected' 'seven_day' ($now+86400) 'some-other-session') -CliSessionId $sid
+        Check "record bound to another session is ignored" (-not (Test-Path $StateFile))
+
+        # PROVENANCE: a stale record (old timestamp) -> ignored
+        $old = ([DateTimeOffset]::UtcNow.AddHours(-2)).ToString('o')
+        Test-QuotaLine -Line (Rec 'rejected' 'seven_day' ($now+86400) $sid $old) -CliSessionId $sid
+        Check "stale (2h old) record is ignored" (-not (Test-Path $StateFile))
+
+        # DEDUPE: the same rejection seen twice acts only once
+        $script:HandledRejections = @{}
+        Test-QuotaLine -Line (Rec 'rejected' 'seven_day' ($now+99999)) -CliSessionId $sid
+        Remove-Item $StateFile -Force -ErrorAction SilentlyContinue
+        Test-QuotaLine -Line (Rec 'rejected' 'seven_day' ($now+99999)) -CliSessionId $sid
+        Check "duplicate rejection does not re-fire" (-not (Test-Path $StateFile))
+
+        # short five_hour under the wait floor -> recorded but no failover
+        Remove-Item $StateFile -Force -ErrorAction SilentlyContinue
+        $script:HandledRejections = @{}
+        Test-QuotaLine -Line (Rec 'rejected' 'five_hour' ($now+300)) -CliSessionId $sid
         Check "short five_hour recorded a cooldown, no switch" (Test-Path $StateFile)
 
-        # an accepted quota line -> ignored
-        $before = if (Test-Path $LogFile) { (Get-Item $LogFile).Length } else { 0 }
-        Test-QuotaLine -Line '{"quotaLimits":{"status":"allowed","rateLimitType":"seven_day"}}' -CliSessionId 'selftest'
+        # accepted quota line -> ignored
+        $script:HandledRejections = @{}
+        Test-QuotaLine -Line (Rec 'allowed' 'seven_day' ($now+86400)) -CliSessionId $sid
         Check "non-rejected quota line ignored" ($true)
 
-        # format-drift tripwire fires on an unrecognised rate-limit shape
+        # format-drift tripwire fires on a real API-error record of unknown shape
         $script:DriftWarned = $false
-        Test-QuotaLine -Line '{"someNewShape":{"rateLimitType":"seven_day","remaining":0}}' -CliSessionId 'selftest'
-        Check "format-drift tripwire fired on unknown shape" ($script:DriftWarned)
+        Test-QuotaLine -Line ('{"type":"assistant","isApiErrorMessage":true,"sessionId":"' + $sid + '","someNewShape":{"limit":"seven_day"}}') -CliSessionId $sid
+        Check "format-drift tripwire fired on unknown API-error shape" ($script:DriftWarned)
 
-        # a normal line does NOT trip drift
+        # an ordinary line does NOT trip drift
         $script:DriftWarned = $false
-        Test-QuotaLine -Line '{"type":"assistant","text":"hello"}' -CliSessionId 'selftest'
+        Test-QuotaLine -Line '{"type":"assistant","message":{"content":"hello"}}' -CliSessionId $sid
         Check "ordinary line does not trip drift" (-not $script:DriftWarned)
 
         Remove-Item $StateFile, $LogFile -Force -ErrorAction SilentlyContinue
