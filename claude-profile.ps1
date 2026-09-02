@@ -417,16 +417,43 @@ function Restore-Profile {
         foreach ($item in $Items) {
             $rb = Join-Path $rollback $item.Stored
             if (Test-Path $rb) {
-                Copy-Entry -From $rb -To $item.Live -Type $item.Type -Label $item.Stored
+                try { Copy-Entry -From $rb -To $item.Live -Type $item.Type -Label $item.Stored } catch { }
             }
         }
-        Remove-Item $SwitchMarker -Force -ErrorAction SilentlyContinue
+        # Do NOT clear the marker here. Rollback is best-effort and can itself
+        # fail (e.g. the app relaunched and re-locked the cookie DB), which would
+        # leave the live store inconsistent. Keeping the marker means the next
+        # launch re-applies the target profile -- which is intact in the store --
+        # instead of silently living with a corrupt session.
         throw
     }
 
     Remove-Item $SwitchMarker -Force -ErrorAction SilentlyContinue
     Remove-Item $rollback -Recurse -Force -ErrorAction SilentlyContinue
     Write-Text $Marker $ProfileName
+}
+
+# Recover from a crash inside Save-Profile's final swap. Between moving the old
+# profile aside (.backup-<name>) and moving the new one into place, <name> does
+# not exist; a hard kill there would otherwise strand the profile as a dotted dir
+# that 'list' hides and nothing restores.
+function Repair-Saves {
+    foreach ($b in Get-ChildItem $Store -Directory -Filter '.backup-*' -ErrorAction SilentlyContinue) {
+        $name = $b.Name.Substring('.backup-'.Length)
+        $final = Join-Path $Store $name
+        if (Test-Path $final) {
+            Remove-Item $b.FullName -Recurse -Force -ErrorAction SilentlyContinue   # swap completed; backup is stale
+        } else {
+            Move-Item $b.FullName $final -ErrorAction SilentlyContinue              # swap died mid-way; recover
+            Write-Host "  Recovered profile '$name' from an interrupted save." -ForegroundColor Yellow
+        }
+    }
+    # Staging dirs are only complete for an instant before the swap; a leftover
+    # one is an incomplete attempt. The real profile (or its recovered backup) is
+    # authoritative, so discard it.
+    foreach ($s in Get-ChildItem $Store -Directory -Filter '.staging-*' -ErrorAction SilentlyContinue) {
+        Remove-Item $s.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Run at startup. If a previous switch was interrupted mid-copy, the live store
@@ -457,8 +484,10 @@ function Repair-IfInterrupted {
 
 if (-not (Test-Path $Store)) { New-Item -ItemType Directory -Path $Store -Force | Out-Null }
 
-# Recover from an interrupted previous switch before doing anything else.
-# Read-only commands do not need the lock; the repair itself takes it if it acts.
+# Recover from interrupted operations before doing anything else. Repair-Saves
+# is cheap and always safe (it only touches orphaned .backup-*/.staging-* dirs);
+# the interrupted-switch repair takes the lock if it acts.
+Repair-Saves
 if ((Test-Path $SwitchMarker) -and $Command -notin @('save','switch')) {
     Enter-ProfileLock
     try { Repair-IfInterrupted } finally { Exit-ProfileLock }
@@ -621,8 +650,7 @@ switch ($Command) {
             throw "Profile '$Name' is incomplete. Re-save it while signed into that account."
         }
 
-        $cur = Get-CurrentProfile
-        if ($cur -eq $Name) {
+        if ((Get-CurrentProfile) -eq $Name) {
             Write-Host "Already on profile '$Name'." -ForegroundColor Yellow
             break
         }
@@ -630,18 +658,28 @@ switch ($Command) {
         Enter-ProfileLock
         try {
             Repair-IfInterrupted
-            Stop-ClaudeApp
 
-            # Re-save the outgoing profile first: tokens refresh during use, and
-            # skipping this rolls that account back to a stale session.
-            if ($cur -and (Test-Path (Join-Path $Store $cur))) {
-                Save-Profile -ProfileName $cur -Quiet
-                Write-Host "Checkpointed outgoing profile '$cur'." -ForegroundColor DarkGray
-            } elseif (Get-CurrentEmail) {
-                Write-Warning "Current session belongs to no saved profile and will be replaced."
+            # Read the outgoing profile AFTER repair. Repair-IfInterrupted can
+            # re-apply an interrupted switch and rewrite the current-profile
+            # marker, so a value captured earlier would name the wrong profile
+            # and the checkpoint below would overwrite it with the wrong session.
+            $cur = Get-CurrentProfile
+            if ($cur -eq $Name) {
+                Write-Host "Already on profile '$Name' after repair." -ForegroundColor Yellow
+            } else {
+                Stop-ClaudeApp
+
+                # Re-save the outgoing profile first: tokens refresh during use,
+                # and skipping this rolls that account back to a stale session.
+                if ($cur -and (Test-Path (Join-Path $Store $cur))) {
+                    Save-Profile -ProfileName $cur -Quiet
+                    Write-Host "Checkpointed outgoing profile '$cur'." -ForegroundColor DarkGray
+                } elseif (Get-CurrentEmail) {
+                    Write-Warning "Current session belongs to no saved profile and will be replaced."
+                }
+
+                Restore-Profile -ProfileName $Name
             }
-
-            Restore-Profile -ProfileName $Name
         } finally { Exit-ProfileLock }
 
         $acct = Get-ProfileAccount $Name

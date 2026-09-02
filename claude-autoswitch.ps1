@@ -748,26 +748,60 @@ switch ($Command) {
         Write-Host "  Ctrl+C to stop."
         Write-Host ""
 
+        # Remember the code we started with. If the .ps1 files change underneath
+        # a long-running (hidden, login-started) watcher, it keeps running the OLD
+        # code until restarted -- so a `git pull` "fix" doesn't take effect. Warn
+        # when that happens instead of silently running stale logic.
+        $ownFiles = @($PSCommandPath, $ProfileScript) | Where-Object { $_ -and (Test-Path $_) }
+        function Get-CodeStamp { ($ownFiles | ForEach-Object { (Get-Item $_).LastWriteTimeUtc.Ticks }) -join ',' }
+        $startStamp = Get-CodeStamp
+        $staleWarned = $false
+
         # Seed offsets at end-of-file so historical rejections are not replayed.
+        # Retry an empty first enumeration (a transient I/O gap at process
+        # startup) so we don't start blind.
+        $watcherStart = Get-Date
+        $seed = @(Get-TranscriptFiles)
+        for ($r = 0; $r -lt 5 -and $seed.Count -eq 0 -and (Test-Path $ProjectsRoot); $r++) {
+            Start-Sleep -Seconds 1; $seed = @(Get-TranscriptFiles)
+        }
         $offsets = @{}
-        foreach ($f in Get-TranscriptFiles) { $offsets[$f.FullName] = $f.Length }
+        foreach ($f in $seed) { $offsets[$f.FullName] = $f.Length }
+
         Write-Log "Watching $($offsets.Count) transcript(s). Live account: $(Get-LiveAccountUuid)"
         $lastBeat = Get-NowEpoch
 
         while ($true) {
             Start-Sleep -Seconds $IntervalSeconds
 
+            # A transient error on one iteration must never kill a long-running
+            # watcher (that is how a hidden watcher silently dies). Log and carry
+            # on; a genuine bug still shows up in the log every interval.
+            try {
+
             if ((Get-NowEpoch) - $lastBeat -ge $HeartbeatSeconds) {
                 Write-Log "alive - watching $((Get-TranscriptFiles).Count) transcript(s), on $(Get-LiveAccountUuid)" 'DarkGray'
                 $lastBeat = Get-NowEpoch
+                if (-not $staleWarned -and (Get-CodeStamp) -ne $startStamp) {
+                    $staleWarned = $true
+                    Write-Log "The switcher scripts changed on disk - this watcher is running OLD code. Restart it (Stop then Start, or re-login) to pick up the update." 'Yellow'
+                    Show-Toast 'Claude switcher: watcher is out of date' 'The scripts were updated. Restart the watcher to run the new version.'
+                }
             }
 
             foreach ($f in Get-TranscriptFiles) {
                 $path = $f.FullName
                 if (-not $offsets.ContainsKey($path)) {
-                    # A session that started after we did: read it from the top.
-                    $offsets[$path] = 0
-                    Write-Log "New transcript: $($f.Name)" 'DarkGray'
+                    # A file we did not seed. If it predates the watcher (missed
+                    # at seed, or a transient enumeration gap) start at EOF so its
+                    # history is not re-scanned; only genuinely new files are read
+                    # from the top.
+                    if ($f.LastWriteTime -le $watcherStart) {
+                        $offsets[$path] = $f.Length
+                    } else {
+                        $offsets[$path] = 0
+                        Write-Log "New transcript: $($f.Name)" 'DarkGray'
+                    }
                 }
                 if ($f.Length -eq $offsets[$path]) { continue }
 
@@ -776,6 +810,10 @@ switch ($Command) {
                     param($line)
                     Test-QuotaLine -Line $line -CliSessionId $cli
                 }
+            }
+
+            } catch {
+                Write-Log "  watch-loop error (continuing): $($_.Exception.Message)" 'Red'
             }
         }
     }

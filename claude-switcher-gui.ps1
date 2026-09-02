@@ -481,8 +481,24 @@ function Update-All {
     if ($running) {
         $ids = '?'
         if ($list.Count -gt 0) { $ids = ($list | ForEach-Object { $_.ProcessId }) -join ', ' }
-        $lblWatch.Text = "Watcher: RUNNING  (PID $ids)"
-        $lblWatch.ForeColor = [System.Drawing.Color]::SeaGreen
+
+        # Stale if any script file was modified after the watcher process started
+        # -- it's running code older than what's on disk.
+        $stale = $false
+        $newestPs1 = (Get-ChildItem $ScriptDir -Filter '*.ps1' -ErrorAction SilentlyContinue |
+                      Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+        if ($newestPs1 -and $list.Count -gt 0) {
+            $oldestStart = ($list | ForEach-Object { $_.CreationDate } | Sort-Object | Select-Object -First 1)
+            if ($oldestStart -and $newestPs1.LastWriteTime -gt $oldestStart) { $stale = $true }
+        }
+
+        if ($stale) {
+            $lblWatch.Text = "Watcher: RUNNING but OUTDATED (PID $ids) - Stop then Start to update"
+            $lblWatch.ForeColor = [System.Drawing.Color]::DarkGoldenrod
+        } else {
+            $lblWatch.Text = "Watcher: RUNNING  (PID $ids)"
+            $lblWatch.ForeColor = [System.Drawing.Color]::SeaGreen
+        }
     } elseif (-not $q.Ok) {
         $lblWatch.Text = 'Watcher: UNKNOWN - could not query processes'
         $lblWatch.ForeColor = [System.Drawing.Color]::DarkGoldenrod
@@ -691,7 +707,7 @@ $btnCopySession.Add_Click({
 })
 
 $watchBtn['start'].Add_Click({
-    if ((Get-WatcherProcs).Count -gt 0) {
+    if (Test-WatcherRunning) {
         [void][System.Windows.Forms.MessageBox]::Show('A watcher is already running.', 'Claude Switcher', 'OK', 'Information')
         return
     }
