@@ -1,0 +1,11 @@
+# PowerShell scripts are run on Windows; keep CRLF so the shortcut and hidden
+# host never trip over lone LFs, regardless of the cloner's platform.
+*.ps1 text eol=crlf
+
+# Docs stay LF so they read cleanly everywhere.
+*.md   text eol=lf
+LICENSE text eol=lf
+
+# Never let Git muck with these as text.
+*.png  binary
+*.ico  binary

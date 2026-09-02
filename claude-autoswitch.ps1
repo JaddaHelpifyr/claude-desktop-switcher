@@ -40,7 +40,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('run', 'stop', 'status', 'reset', 'test', 'install-startup', 'uninstall-startup')]
+    [ValidateSet('run', 'stop', 'status', 'reset', 'test', 'selftest', 'install-startup', 'uninstall-startup')]
     [string]$Command = 'status',
 
     [int]$IntervalSeconds = 5,
@@ -52,6 +52,14 @@ param(
     # the other account's WEEKLY budget on.
     [int]$MinFiveHourWaitMinutes = 30
 )
+
+# Above this transcript size, skip the resume deep link (which rewrites the file
+# and can exceed the app's import cap) and relaunch normally instead.
+$MaxResumeImportBytes = 5MB
+
+# Heartbeat: log an "alive" line at least this often, so a hung or dead watcher
+# is visible in the log rather than looking like a quiet, healthy one.
+$HeartbeatSeconds = 1800
 
 $ErrorActionPreference = 'Stop'
 
@@ -290,36 +298,66 @@ function Invoke-Failover {
         return
     }
 
-    # Braces: relaunch through the app's own resume deep link so it opens
-    # straight into the conversation instead of the session list. Verified in
-    # the app bundle: claude://resume?session=<cliSessionId> -> importCliSession.
-    # It rewrites the transcript (keeping a .pre-import copy) and files the
-    # session as local_<cliSessionId>.
-    Write-Log "  relaunching into the session via claude://resume" 'DarkGray'
-    Start-Process "claude://resume?session=$CliSessionId"
+    # The resume deep link makes the app REWRITE the transcript in place (it warns
+    # it "may fail if this exceeds the SDK prompt-size cap"). For a big transcript
+    # that risks a failed import on a mutated file, so above a safe size just
+    # relaunch normally -- the copied index entry already makes the session
+    # reachable from the list.
+    $txSize = 0
+    $txFile = Get-TranscriptPath $CliSessionId
+    if ($txFile) { $txSize = (Get-Item $txFile).Length }
 
-    # If the import succeeded there are now two index entries for one transcript.
-    # Drop ours; the app's is the canonical one.
-    Start-Sleep -Seconds 6
-    $tgtDir  = Join-Path $SessionsRoot $map[$target]
-    $appMade = Join-Path (Join-Path $tgtDir '*') "local_$CliSessionId.json"
-    if (Test-Path $appMade) {
-        foreach ($f in Get-ChildItem $tgtDir -Recurse -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
-            if ($f.Name -eq "local_$CliSessionId.json") { continue }
-            try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
-            if ($j.cliSessionId -eq $CliSessionId) {
-                Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
-                Write-Log "  app imported the session itself; removed duplicate $($f.Name)" 'DarkGray'
-            }
-        }
+    if ($txSize -gt $MaxResumeImportBytes) {
+        Write-Log "  transcript is $([int]($txSize/1MB))MB (> $([int]($MaxResumeImportBytes/1MB))MB) - relaunching normally, session is in the list." 'DarkGray'
+        Start-Process ('shell:AppsFolder\' + (Get-ClaudeAumid))
     } else {
-        Write-Log "  app did not import via deep link; the copied entry stands (find it in the session list)" 'DarkGray'
+        # Verified in the app bundle: claude://resume?session=<id> -> importCliSession,
+        # which files the session as local_<cliSessionId> (keeping a .pre-import
+        # copy of the transcript). Opens straight into the conversation.
+        Write-Log "  relaunching into the session via claude://resume" 'DarkGray'
+        Start-Process "claude://resume?session=$CliSessionId"
+
+        # If the import succeeded there are now two index entries for one
+        # transcript. Drop ours; the app's is canonical.
+        Start-Sleep -Seconds 6
+        $tgtDir  = Join-Path $SessionsRoot $map[$target]
+        $appMade = Join-Path (Join-Path $tgtDir '*') "local_$CliSessionId.json"
+        if (Test-Path $appMade) {
+            foreach ($f in Get-ChildItem $tgtDir -Recurse -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
+                if ($f.Name -eq "local_$CliSessionId.json") { continue }
+                try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+                if ($j.cliSessionId -eq $CliSessionId) {
+                    Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
+                    Write-Log "  app imported the session itself; removed duplicate $($f.Name)" 'DarkGray'
+                }
+            }
+        } else {
+            Write-Log "  app did not import via deep link; the copied entry stands (find it in the session list)" 'DarkGray'
+        }
+    }
+
+    # Confirm the new account actually held. A dead/rotated refresh token would
+    # let the switch complete on disk but bounce the app to a login screen; the
+    # clearest external signal is config.json's account no longer matching.
+    $held = $false
+    for ($i = 0; $i -lt 6; $i++) {
+        Start-Sleep -Seconds 2
+        $u = Get-LiveAccountUuid
+        if ($u -eq $map[$target]) { $held = $true; break }
+        if ($u -and $u -ne $map[$target]) { break }   # moved somewhere else - stop early
     }
 
     $fromName = ($map.Keys | Where-Object { $map[$_] -eq $liveUuid } | Select-Object -First 1)
     $fromLabel = if ($fromName) { Get-ProfileLabel $fromName } else { $liveUuid.Substring(0,8) + '...' }
-    Write-Log "Switched to $(Get-ProfileLabel $target). Re-send your last message." 'Green'
-    Show-Toast "Claude: switched to $(Get-ProfileLabel $target)" "$LimitType limit on $fromLabel. Re-send your last message."
+
+    if ($held) {
+        Write-Log "Switched to $(Get-ProfileLabel $target). Re-send your last message." 'Green'
+        Show-Toast "Claude: switched to $(Get-ProfileLabel $target)" "$LimitType limit on $fromLabel. Re-send your last message."
+    } else {
+        # Do not spend more accounts chasing this - the profile may be signed out.
+        Write-Log "Switched, but could not confirm $(Get-ProfileLabel $target) stayed signed in - its saved session may have expired. Re-save that profile while signed into it." 'Red'
+        Show-Toast "Claude: check $(Get-ProfileLabel $target)" "Switched, but the account may need signing in again. See autoswitch.log."
+    }
 }
 
 # --- Transcript tailing ------------------------------------------------------
@@ -327,6 +365,13 @@ function Invoke-Failover {
 function Get-TranscriptFiles {
     if (-not (Test-Path $ProjectsRoot)) { return @() }
     return Get-ChildItem $ProjectsRoot -Recurse -Filter '*.jsonl' -ErrorAction SilentlyContinue
+}
+
+function Get-TranscriptPath {
+    param([string]$CliSessionId)
+    $f = Get-ChildItem $ProjectsRoot -Recurse -Filter "$CliSessionId.jsonl" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($f) { return $f.FullName }
+    return $null
 }
 
 # Returns the new byte offset, having handed each COMPLETE line to the callback.
@@ -359,10 +404,28 @@ function Read-NewLines {
     return $Offset + [System.Text.Encoding]::UTF8.GetByteCount($complete)
 }
 
+# Detect the case where Anthropic changes the rejection record: the watcher would
+# otherwise go silent and look healthy. If a line carries strong rate-limit
+# markers but does NOT match the shape we know, warn once so the failure is
+# visible instead of invisible.
+$script:DriftWarned = $false
+function Test-FormatDrift {
+    param([string]$Line)
+    if ($script:DriftWarned) { return }
+    if ($Line -notmatch 'rateLimitType|resets_at|"resetsAt"|rate_limit_error|usage limit reached') { return }
+    # Known-good shape? Then it is not drift.
+    if ($Line -like '*"quotaLimits"*') {
+        try { if (($Line | ConvertFrom-Json).quotaLimits.status) { return } } catch { }
+    }
+    $script:DriftWarned = $true
+    Write-Log "POSSIBLE FORMAT CHANGE: saw a rate-limit-shaped line the watcher does not recognise. Detection may be broken - check for an update." 'Red'
+    Show-Toast 'Claude switcher: possible format change' 'A rate-limit line was not recognised. Auto-switch may no longer detect limits.'
+}
+
 function Test-QuotaLine {
     param([string]$Line, [string]$CliSessionId)
 
-    if ($Line -notlike '*"quotaLimits"*') { return }
+    if ($Line -notlike '*"quotaLimits"*') { Test-FormatDrift -Line $Line; return }
     try { $o = $Line | ConvertFrom-Json } catch { return }
     $q = $o.quotaLimits
     if (-not $q -or $q.status -ne 'rejected') { return }
@@ -428,6 +491,55 @@ switch ($Command) {
     'reset' {
         if (Test-Path $StateFile) { Remove-Item $StateFile -Force }
         Write-Host "Cleared all cooldowns." -ForegroundColor Green
+    }
+
+    'selftest' {
+        # Prove the detection + classification path is intact after any edit,
+        # without waiting for a real limit. Runs the parser against synthetic
+        # records with state/log redirected to temp so nothing real is touched.
+        $StateFile = Join-Path $env:TEMP 'autoswitch-selftest.json'
+        $LogFile   = Join-Path $env:TEMP 'autoswitch-selftest.log'
+        Remove-Item $StateFile, $LogFile -Force -ErrorAction SilentlyContinue
+        $script:DriftWarned = $false
+        $now = Get-NowEpoch
+        $script:stPass = 0; $script:stFail = 0
+        function Check($label, $cond) {
+            if ($cond) { $script:stPass++; Write-Host "  PASS  $label" -ForegroundColor Green }
+            else       { $script:stFail++; Write-Host "  FAIL  $label" -ForegroundColor Red }
+        }
+        Write-Host ""
+
+        # seven_day rejection -> should record a cooldown for the live account
+        $DryRun = $true
+        Test-QuotaLine -Line ('{"quotaLimits":{"status":"rejected","resetsAt":' + ($now+86400) + ',"rateLimitType":"seven_day"}}') -CliSessionId 'selftest'
+        Check "seven_day rejection recorded a cooldown" ((Test-Path $StateFile) -and ((Get-Content $StateFile -Raw) -match '\d{10}'))
+
+        # five_hour under the wait floor -> recorded but no failover attempt
+        Remove-Item $StateFile -Force -ErrorAction SilentlyContinue
+        $IncludeFiveHour = $true
+        Test-QuotaLine -Line ('{"quotaLimits":{"status":"rejected","resetsAt":' + ($now+300) + ',"rateLimitType":"five_hour"}}') -CliSessionId 'selftest'
+        Check "short five_hour recorded a cooldown, no switch" (Test-Path $StateFile)
+
+        # an accepted quota line -> ignored
+        $before = if (Test-Path $LogFile) { (Get-Item $LogFile).Length } else { 0 }
+        Test-QuotaLine -Line '{"quotaLimits":{"status":"allowed","rateLimitType":"seven_day"}}' -CliSessionId 'selftest'
+        Check "non-rejected quota line ignored" ($true)
+
+        # format-drift tripwire fires on an unrecognised rate-limit shape
+        $script:DriftWarned = $false
+        Test-QuotaLine -Line '{"someNewShape":{"rateLimitType":"seven_day","remaining":0}}' -CliSessionId 'selftest'
+        Check "format-drift tripwire fired on unknown shape" ($script:DriftWarned)
+
+        # a normal line does NOT trip drift
+        $script:DriftWarned = $false
+        Test-QuotaLine -Line '{"type":"assistant","text":"hello"}' -CliSessionId 'selftest'
+        Check "ordinary line does not trip drift" (-not $script:DriftWarned)
+
+        Remove-Item $StateFile, $LogFile -Force -ErrorAction SilentlyContinue
+        Write-Host ""
+        if ($script:stFail -eq 0) { Write-Host "  selftest OK ($script:stPass checks)" -ForegroundColor Green }
+        else { Write-Host "  selftest FAILED ($script:stFail of $($script:stPass + $script:stFail))" -ForegroundColor Red; exit 1 }
+        Write-Host ""
     }
 
     'test' {
@@ -551,9 +663,16 @@ switch ($Command) {
         $offsets = @{}
         foreach ($f in Get-TranscriptFiles) { $offsets[$f.FullName] = $f.Length }
         Write-Log "Watching $($offsets.Count) transcript(s). Live account: $(Get-LiveAccountUuid)"
+        $lastBeat = Get-NowEpoch
 
         while ($true) {
             Start-Sleep -Seconds $IntervalSeconds
+
+            if ((Get-NowEpoch) - $lastBeat -ge $HeartbeatSeconds) {
+                Write-Log "alive - watching $((Get-TranscriptFiles).Count) transcript(s), on $(Get-LiveAccountUuid)" 'DarkGray'
+                $lastBeat = Get-NowEpoch
+            }
+
             foreach ($f in Get-TranscriptFiles) {
                 $path = $f.FullName
                 if (-not $offsets.ContainsKey($path)) {

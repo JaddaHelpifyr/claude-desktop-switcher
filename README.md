@@ -134,6 +134,32 @@ That's the only local signal — nothing on disk reports how much of your quota 
 spent, so a limit can only be seen *after* a request is refused. The turn that
 triggers it is lost and must be re-sent after the switch.
 
+## Robustness
+
+Switching mutates a live credential store the app doesn't know is being touched,
+so the tool guards the failure modes that come with that:
+
+- **One switch at a time.** A cross-process lock stops the watcher and a manual
+  switch from mutating the same files at once (which could corrupt the store).
+- **Crash recovery.** A switch that dies mid-copy (power loss, killed process)
+  is detected at next launch and repaired by re-applying the target profile,
+  which stays intact in the store. `doctor` shows a pending repair.
+- **Integrity checks.** A profile is only "ok" if its `config.json` parses with
+  an account UUID and its cookie DB is non-empty — not merely that files exist.
+- **Format-drift tripwire.** If a rate-limit line appears that the watcher
+  doesn't recognise (e.g. after an app update changes the record), it warns and
+  toasts instead of going silently blind. `selftest` proves the detector still
+  works on demand.
+- **Dead-session check.** After a switch it confirms the app stayed on the new
+  account; if a saved session has expired it says so rather than looping.
+- **Large-session guard.** Very large transcripts skip the resume deep link (it
+  rewrites the file) and relaunch normally instead.
+- **Heartbeat.** The watcher logs an "alive" line periodically, so a hung one is
+  visible in the log rather than looking healthy.
+
+None of this removes the underlying fragility below — it makes the failures
+loud and recoverable instead of silent.
+
 ## Limitations
 
 - **Windows only.** Cookie encryption is DPAPI-bound.
@@ -147,7 +173,14 @@ triggers it is lost and must be re-sent after the switch.
 - **The app's own account menu switches only the Chat/Cowork session**, not
   Claude Code. They authenticate separately. Use a full Log out to move both.
 - Detection matches a private, undocumented record shape and could break with an
-  app update. It fails loudly rather than silently.
+  app update. The format-drift tripwire makes that loud rather than silent, but
+  it can only warn *after* an unrecognised limit line appears — run `selftest`
+  after any Claude update to confirm the detector still works.
+- **A saved session can still go stale.** If you sign into an account directly in
+  the app (not through this tool) it rotates that account's token, leaving the
+  saved profile's token dead until you re-save. Refresh tokens also expire with
+  age. The dead-session check catches this after a switch, but the fix is to
+  re-save the profile while signed into it.
 
 ## A note on rate limits
 
@@ -176,7 +209,7 @@ The GUI covers everything, but each script runs standalone:
 .\claude-sessions.ps1 list <account>
 .\claude-sessions.ps1 copy <sessionId> <account>
 
-.\claude-autoswitch.ps1 status|test|reset
+.\claude-autoswitch.ps1 status|test|selftest|reset
 .\claude-autoswitch.ps1 run [-DryRun] [-IncludeFiveHour] [-MinFiveHourWaitMinutes N]
 .\claude-autoswitch.ps1 stop
 .\claude-autoswitch.ps1 install-startup [-DryRun] [-IncludeFiveHour] [-MinFiveHourWaitMinutes N]

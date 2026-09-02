@@ -416,7 +416,8 @@ $watchButtons = @(
     @{ Text = "Don't run on login";   X = 176; Y = 214; Name = 'uninstall'},
     @{ Text = 'Open log';             X = 12;  Y = 258; Name = 'log'      },
     @{ Text = 'Clear cooldowns';      X = 176; Y = 258; Name = 'reset'    },
-    @{ Text = 'Replay past limits';   X = 340; Y = 258; Name = 'test'     }
+    @{ Text = 'Replay past limits';   X = 340; Y = 258; Name = 'test'     },
+    @{ Text = 'Self-test';            X = 340; Y = 214; Name = 'selftest' }
 )
 $watchBtn = @{}
 foreach ($b in $watchButtons) {
@@ -728,6 +729,7 @@ $watchBtn['reset'].Add_Click({
 })
 
 $watchBtn['test'].Add_Click({ Invoke-Tool $AutoScript @('test') })
+$watchBtn['selftest'].Add_Click({ Invoke-Tool $AutoScript @('selftest') })
 
 # --- Tooltips ----------------------------------------------------------------
 
@@ -763,6 +765,7 @@ $tip.SetToolTip($watchBtn['uninstall'], 'Remove the Startup entry. Does NOT stop
 $tip.SetToolTip($watchBtn['log'],       'Open autoswitch.log in Notepad. It lives in .claude-profiles, next to your saved profiles.')
 $tip.SetToolTip($watchBtn['reset'],     "Forget which accounts are rate limited.`nDoes NOT grant capacity - if an account is still limited, the watcher will switch to it and be refused again.")
 $tip.SetToolTip($watchBtn['test'],      'Replay past rate-limit records found in your transcripts and show what the watcher would do with each. Changes nothing.')
+$tip.SetToolTip($watchBtn['selftest'],  'Run synthetic limits through the detector to prove it still works after an edit or app update. Changes nothing.')
 
 # --- Go ----------------------------------------------------------------------
 

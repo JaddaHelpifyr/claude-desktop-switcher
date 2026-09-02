@@ -119,6 +119,38 @@ $Items = @(
 $CookieDb   = Join-Path $AppRoot 'Network\Cookies'
 $AppConfig  = Join-Path $AppRoot 'config.json'
 
+# Written just before Restore-Profile starts mutating the live app directory and
+# deleted the instant it finishes. If present at startup, a previous switch was
+# interrupted mid-copy -- the live store may hold a DPAPI key from one account
+# over cookies from another (undecryptable). The named profile is intact in the
+# store, so we can re-apply it to return to a known-good state.
+$SwitchMarker = Join-Path $Store '.switch-in-progress'
+
+# One profile mutation at a time across every process (watcher + GUI + CLI). Two
+# concurrent Restore-Profile runs over the same six files is the fastest route to
+# a corrupted live store; the watcher and a manual switch can otherwise collide.
+$ProfileLockName = 'Global\ClaudeSwitcherProfileOp'
+$script:ProfileMutex = $null
+
+function Enter-ProfileLock {
+    $isNew = $false
+    $script:ProfileMutex = New-Object System.Threading.Mutex($false, $ProfileLockName, [ref]$isNew)
+    $got = $false
+    try { $got = $script:ProfileMutex.WaitOne([TimeSpan]::FromSeconds(90)) }
+    catch [System.Threading.AbandonedMutexException] { $got = $true }  # prior holder died mid-op; we own it now
+    if (-not $got) {
+        throw "Another switch or save is already in progress (waited 90s). Try again in a moment."
+    }
+}
+
+function Exit-ProfileLock {
+    if ($script:ProfileMutex) {
+        try { $script:ProfileMutex.ReleaseMutex() } catch { }
+        $script:ProfileMutex.Dispose()
+        $script:ProfileMutex = $null
+    }
+}
+
 # --- Text helpers (BOM-free; PS 5.1's -Encoding utf8 writes a BOM) -----------
 
 function Write-Text {
@@ -221,6 +253,16 @@ function Test-ProfileComplete {
     foreach ($item in $Items) {
         if (-not (Test-Path (Join-Path $dir $item.Stored))) { return $false }
     }
+    # Presence is not enough -- a profile whose config.json is truncated or whose
+    # cookie DB is empty looks complete but restores a broken session. Validate
+    # the two files that actually carry auth.
+    $cfg = Join-Path $dir 'config.json'
+    try {
+        $c = Get-Content $cfg -Raw | ConvertFrom-Json
+        if (-not $c.lastKnownAccountUuid) { return $false }
+    } catch { return $false }
+    $ck = Join-Path $dir 'Network\Cookies'
+    if ((Test-Path $ck) -and ((Get-Item $ck).Length -eq 0)) { return $false }
     return $true
 }
 
@@ -360,6 +402,11 @@ function Restore-Profile {
         }
     }
 
+    # Mark the live store as mid-mutation. If anything kills us between here and
+    # the delete below (power loss, Task Manager), startup repair re-applies this
+    # same profile, which is intact in the store.
+    Write-Text $SwitchMarker $ProfileName
+
     try {
         foreach ($item in $Items) {
             Copy-Entry -From (Join-Path $src $item.Stored) -To $item.Live `
@@ -373,16 +420,49 @@ function Restore-Profile {
                 Copy-Entry -From $rb -To $item.Live -Type $item.Type -Label $item.Stored
             }
         }
+        Remove-Item $SwitchMarker -Force -ErrorAction SilentlyContinue
         throw
     }
 
+    Remove-Item $SwitchMarker -Force -ErrorAction SilentlyContinue
     Remove-Item $rollback -Recurse -Force -ErrorAction SilentlyContinue
     Write-Text $Marker $ProfileName
+}
+
+# Run at startup. If a previous switch was interrupted mid-copy, the live store
+# may be inconsistent; re-apply the profile that was being restored.
+function Repair-IfInterrupted {
+    if (-not (Test-Path $SwitchMarker)) { return }
+    $target = Read-Text $SwitchMarker
+    Write-Host ""
+    Write-Host "  A previous switch to '$target' was interrupted - the live session may be" -ForegroundColor Yellow
+    Write-Host "  inconsistent. Repairing by re-applying that profile..." -ForegroundColor Yellow
+    Write-Host ""
+
+    if (-not $target -or -not (Test-ProfileComplete $target)) {
+        Remove-Item $SwitchMarker -Force -ErrorAction SilentlyContinue
+        Write-Warning "Cannot auto-repair: profile '$target' is missing or incomplete. If Claude asks you to sign in, that is why."
+        return
+    }
+    $procs = Get-Process -Name 'claude' -ErrorAction SilentlyContinue
+    if ($procs) {
+        Write-Warning "Close Claude, then re-run this tool to finish repairing the interrupted switch."
+        return
+    }
+    Restore-Profile -ProfileName $target   # rewrites the marker and clears it on success
+    Write-Host "  Repair complete - live session restored to '$target'." -ForegroundColor Green
 }
 
 # --- Commands ----------------------------------------------------------------
 
 if (-not (Test-Path $Store)) { New-Item -ItemType Directory -Path $Store -Force | Out-Null }
+
+# Recover from an interrupted previous switch before doing anything else.
+# Read-only commands do not need the lock; the repair itself takes it if it acts.
+if ((Test-Path $SwitchMarker) -and $Command -notin @('save','switch')) {
+    Enter-ProfileLock
+    try { Repair-IfInterrupted } finally { Exit-ProfileLock }
+}
 
 # Guard messages are for humans. Without this, PowerShell renders every 'throw'
 # as a RuntimeException with a stack trace and the message repeated twice.
@@ -418,6 +498,11 @@ switch ($Command) {
             Write-Host ("  {0} {1,-16} {2}" -f $mark, $item.Stored, $item.Live) -ForegroundColor $color
         }
         Write-Host ""
+        if (Test-Path $SwitchMarker) {
+            Write-Host "  Interrupted switch pending repair -> '$(Read-Text $SwitchMarker)'" -ForegroundColor Yellow
+            Write-Host "  (close Claude and run 'list' to auto-repair)" -ForegroundColor DarkGray
+            Write-Host ""
+        }
     }
 
     'whoami' {
@@ -518,9 +603,13 @@ switch ($Command) {
             }
         }
 
-        Stop-ClaudeApp
-        Save-Profile -ProfileName $Name
-        Write-Text $Marker $Name
+        Enter-ProfileLock
+        try {
+            Repair-IfInterrupted
+            Stop-ClaudeApp
+            Save-Profile -ProfileName $Name
+            Write-Text $Marker $Name
+        } finally { Exit-ProfileLock }
     }
 
     'switch' {
@@ -538,18 +627,22 @@ switch ($Command) {
             break
         }
 
-        Stop-ClaudeApp
+        Enter-ProfileLock
+        try {
+            Repair-IfInterrupted
+            Stop-ClaudeApp
 
-        # Re-save the outgoing profile first: tokens refresh during use, and
-        # skipping this rolls that account back to a stale session.
-        if ($cur -and (Test-Path (Join-Path $Store $cur))) {
-            Save-Profile -ProfileName $cur -Quiet
-            Write-Host "Checkpointed outgoing profile '$cur'." -ForegroundColor DarkGray
-        } elseif (Get-CurrentEmail) {
-            Write-Warning "Current session belongs to no saved profile and will be replaced."
-        }
+            # Re-save the outgoing profile first: tokens refresh during use, and
+            # skipping this rolls that account back to a stale session.
+            if ($cur -and (Test-Path (Join-Path $Store $cur))) {
+                Save-Profile -ProfileName $cur -Quiet
+                Write-Host "Checkpointed outgoing profile '$cur'." -ForegroundColor DarkGray
+            } elseif (Get-CurrentEmail) {
+                Write-Warning "Current session belongs to no saved profile and will be replaced."
+            }
 
-        Restore-Profile -ProfileName $Name
+            Restore-Profile -ProfileName $Name
+        } finally { Exit-ProfileLock }
 
         $acct = Get-ProfileAccount $Name
         if (-not $acct) { $acct = '<unknown>' }
