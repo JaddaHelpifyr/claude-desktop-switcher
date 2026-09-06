@@ -181,6 +181,61 @@ To confirm a switch actually landed, don't rely on the log alone:
 .\claude-profile.ps1 doctor          # paths, and any pending repair
 ```
 
+## Keeping usage windows warm (optional)
+
+A 5-hour window opens on **first use**, so if you start work at 09:00 your window
+runs 09:00–14:00. Anchoring it earlier — while you're away — puts the window
+boundaries where you want them during the working day, and means a second
+account is ready to take over rather than starting cold.
+
+Warming sends one tiny prompt per account, headlessly, using the bundled Claude
+Code CLI:
+
+```powershell
+.\claude-autoswitch.ps1 warm-login personal      # one-time, per profile
+.\claude-autoswitch.ps1 warm-login work
+.\claude-autoswitch.ps1 warm-status              # what it would do; spends nothing
+.\claude-autoswitch.ps1 warm-now personal        # prime one account immediately
+```
+
+Then enable it on the watcher:
+
+```powershell
+.\claude-autoswitch.ps1 install-startup -IncludeFiveHour -WarmWindows
+```
+
+**It only fires when all of these hold:**
+
+- you've been idle for `-WarmIdleMinutes` (default 20; `0` disables the gate)
+- that account's window is actually **closed** — no activity for 5 hours, so
+  warming achieves something rather than being a no-op
+- the account isn't rate limited
+- at least `-WarmStaggerMinutes` (default 150) since the last account was warmed,
+  so the two windows don't open *and expire* together
+
+Because the windows are staggered, when the first account runs dry mid-morning
+the second still has hours left on its window.
+
+### Why this doesn't touch your credentials
+
+Each account gets its own CLI config directory under `%USERPROFILE%\.claude-cli\`
+via `CLAUDE_CONFIG_DIR`. That means:
+
+- **No credential is ever read, copied or moved by this tool.** Each account's
+  CLI credentials are created by Claude Code's own login and stay put; nothing
+  enters the profile store and the switch set is unchanged.
+- **No account switching to warm.** The CLI acts as whichever account we point
+  it at regardless of which account the desktop app is on, so warming never
+  closes the app or interrupts what you're doing.
+- **No keystroke or focus automation.** It's a headless process, so it works
+  whether the desktop is idle, locked or asleep.
+- Warm sessions live in the isolated config directory, so they don't clutter
+  your real session list and the watcher can't mistake them for activity.
+
+Note the weekly windows are per-model (`seven_day_opus`, `seven_day_sonnet`), so
+`-WarmModel` with a cheaper model may not anchor the window you actually care
+about. Left unset it uses the CLI default.
+
 ## How it works
 
 Your login lives in six places. Switching accounts swaps all six and restarts
@@ -293,6 +348,7 @@ The GUI covers everything, but each script runs standalone:
 .\claude-sessions.ps1 copy <sessionId> <account>
 
 .\claude-autoswitch.ps1 status|test|selftest|reset
+.\claude-autoswitch.ps1 warm-status|warm-login <profile>|warm-now <profile>
 .\claude-autoswitch.ps1 run [-DryRun] [-IncludeFiveHour] [-MinFiveHourWaitMinutes N] [-CarryOverMinutes N]
 .\claude-autoswitch.ps1 stop
 .\claude-autoswitch.ps1 install-startup [-DryRun] [-IncludeFiveHour] [-MinFiveHourWaitMinutes N] [-CarryOverMinutes N]

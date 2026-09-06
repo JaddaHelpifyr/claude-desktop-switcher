@@ -40,8 +40,13 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('run', 'stop', 'status', 'reset', 'test', 'selftest', 'install-startup', 'uninstall-startup')]
+    [ValidateSet('run', 'stop', 'status', 'reset', 'test', 'selftest', 'install-startup', 'uninstall-startup',
+                 'warm-status', 'warm-login', 'warm-now')]
     [string]$Command = 'status',
+
+    # Second positional argument, used by warm-login / warm-now.
+    [Parameter(Position = 1)]
+    [string]$Name,
 
     [int]$IntervalSeconds = 5,
     [switch]$DryRun,
@@ -55,7 +60,31 @@ param(
     # A rate limit blocks the whole account, so every session you were working in
     # is stuck. On failover, carry over every session touched within this many
     # minutes -- not just the one that made the rejected request.
-    [int]$CarryOverMinutes = 60
+    [int]$CarryOverMinutes = 60,
+
+    # --- Window warming (opt-in) --------------------------------------------
+    # A 5-hour window opens on first use, so anchoring it while you are away
+    # means the window boundaries fall where you want them during the day.
+    # Warming only ever fires when you are NOT at the machine and the account's
+    # window is actually closed, so it can never interrupt real work.
+    [switch]$WarmWindows,
+
+    # Only warm after this much continuous inactivity.
+    [int]$WarmIdleMinutes = 20,
+
+    # Leave at least this long between warming one account and the next, so the
+    # windows are staggered rather than opening (and expiring) together.
+    [int]$WarmStaggerMinutes = 150,
+
+    # How often to evaluate whether anything needs warming.
+    [int]$WarmCheckMinutes = 10,
+
+    [string]$WarmText = 'Warm-up ping to start a fresh usage window - no action needed, please just reply OK.',
+
+    # Optional model for the warm request. Left unset it uses the CLI default.
+    # Note the weekly windows are per-model (seven_day_opus, seven_day_sonnet),
+    # so priming with a cheaper model may not anchor the window you care about.
+    [string]$WarmModel = ''
 )
 
 # Above this transcript size, skip the resume deep link (which rewrites the file
@@ -65,6 +94,34 @@ $MaxResumeImportBytes = 5MB
 # Heartbeat: log an "alive" line at least this often, so a hung or dead watcher
 # is visible in the log rather than looking like a quiet, healthy one.
 $HeartbeatSeconds = 1800
+
+# A 5-hour window. An account whose last activity is older than this has no open
+# window, so warming it actually achieves something.
+$FiveHourSeconds = 5 * 60 * 60
+
+# How long since the last keyboard/mouse input. Used only to avoid warming while
+# you are actively working; nothing here sends input.
+if (-not ('SwitcherIdle' -as [type])) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class SwitcherIdle {
+    [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    [DllImport("kernel32.dll")] static extern uint GetTickCount();
+    public static uint Seconds() {
+        LASTINPUTINFO li = new LASTINPUTINFO();
+        li.cbSize = (uint)Marshal.SizeOf(li);
+        if (!GetLastInputInfo(ref li)) return 0;
+        return (GetTickCount() - li.dwTime) / 1000;
+    }
+}
+'@ -ErrorAction SilentlyContinue
+}
+
+function Get-IdleSeconds {
+    try { return [int][SwitcherIdle]::Seconds() } catch { return 0 }
+}
 
 $ErrorActionPreference = 'Stop'
 
@@ -215,6 +272,207 @@ function Format-Epoch {
     param($Epoch)
     if (-not $Epoch) { return '<none>' }
     return ([DateTimeOffset]::FromUnixTimeSeconds([int64]$Epoch).LocalDateTime).ToString('MM-dd HH:mm')
+}
+
+# --- Window warming ----------------------------------------------------------
+#
+# A 5-hour window opens on first use, so anchoring it while you are away puts
+# the window boundaries where you want them during the working day.
+#
+# Warming runs the bundled Claude Code CLI headlessly with CLAUDE_CONFIG_DIR
+# pointed at a per-account directory. That means:
+#   - the CLI acts as whichever account we choose, regardless of which account
+#     the desktop app is on, so warming never switches accounts or closes the app
+#   - we never read, copy or move a credential; each account's CLI credentials
+#     stay in their own directory, created by Claude Code's own login
+#   - it works headless, so a locked or idle desktop is irrelevant
+#   - warm sessions live in the isolated directory, so they neither clutter the
+#     real session list nor get seen by the transcript watcher
+
+$WarmRoot      = Join-Path $env:USERPROFILE '.claude-cli'
+$WarmStateFile = Join-Path $Store 'autoswitch-warm.json'
+
+function Get-ClaudeCliPath {
+    $root = Join-Path $AppRoot 'claude-code'
+    if (-not (Test-Path $root)) { return $null }
+    $v = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+         Sort-Object LastWriteTime -Descending
+    foreach ($d in $v) {
+        $exe = Join-Path $d.FullName 'claude.exe'
+        if (Test-Path $exe) { return $exe }
+    }
+    return $null
+}
+
+function Get-WarmConfigDir { param([string]$ProfileName) return (Join-Path $WarmRoot $ProfileName) }
+
+function Get-WarmState {
+    if (-not (Test-Path $WarmStateFile)) { return @{} }
+    try {
+        $o = Get-Content $WarmStateFile -Raw | ConvertFrom-Json
+        $h = @{}
+        foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = [int64]$p.Value }
+        return $h
+    } catch { return @{} }
+}
+
+function Set-WarmState {
+    param([hashtable]$Map)
+    [System.IO.File]::WriteAllText($WarmStateFile, ($Map | ConvertTo-Json -Depth 3))
+}
+
+# Newest activity the DESKTOP recorded for an account, from its session index.
+function Get-AccountLastActivityEpoch {
+    param([string]$Uuid)
+    $dir = Join-Path $SessionsRoot $Uuid
+    if (-not (Test-Path $dir)) { return 0 }
+    $best = 0
+    foreach ($f in Get-ChildItem $dir -Recurse -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
+        try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+        if ($j.lastActivityAt) {
+            $e = [int64]([math]::Floor([int64]$j.lastActivityAt / 1000))
+            if ($e -gt $best) { $best = $e }
+        }
+    }
+    return $best
+}
+
+# An account's window is open if EITHER the desktop saw activity recently or we
+# warmed it recently. CLI warming does not touch the desktop's session index, so
+# without the second half we would warm the same account every cycle.
+function Get-WindowOpenSince {
+    param([string]$Uuid, [hashtable]$WarmState)
+    $a = Get-AccountLastActivityEpoch $Uuid
+    $b = 0
+    if ($WarmState.ContainsKey($Uuid)) { $b = [int64]$WarmState[$Uuid] }
+    if ($b -gt $a) { return $b }
+    return $a
+}
+
+function Get-WarmCliStatus {
+    param([string]$ProfileName)
+    $cli = Get-ClaudeCliPath
+    if (-not $cli) { return [pscustomobject]@{ Ok = $false; Reason = 'bundled CLI not found' } }
+    $cfg = Get-WarmConfigDir $ProfileName
+    $old = $env:CLAUDE_CONFIG_DIR
+    try {
+        $env:CLAUDE_CONFIG_DIR = $cfg
+        $raw = & $cli auth status 2>&1 | Out-String
+        $j = $null
+        try { $j = $raw | ConvertFrom-Json } catch { }
+        if (-not $j) { return [pscustomobject]@{ Ok = $false; Reason = 'could not read auth status' } }
+        return [pscustomobject]@{ Ok = [bool]$j.loggedIn; Email = $j.email; Reason = $(if ($j.loggedIn) { 'ok' } else { 'not logged in' }) }
+    } finally {
+        if ($null -eq $old) { Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
+        else { $env:CLAUDE_CONFIG_DIR = $old }
+    }
+}
+
+# Fire one warm request as the given profile's account. Returns $null on success
+# or a reason string on failure.
+function Invoke-WarmAccount {
+    param([string]$ProfileName)
+    $cli = Get-ClaudeCliPath
+    if (-not $cli) { return 'bundled CLI not found' }
+    $cfg = Get-WarmConfigDir $ProfileName
+    if (-not (Test-Path $cfg)) { return "no CLI config dir for '$ProfileName' - run: warm-login $ProfileName" }
+
+    $old = $env:CLAUDE_CONFIG_DIR
+    try {
+        $env:CLAUDE_CONFIG_DIR = $cfg
+        $args = @('-p', $WarmText)
+        if ($WarmModel) { $args += @('--model', $WarmModel) }
+        $out = & $cli @args 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            $first = ($out -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+            return "CLI exited $LASTEXITCODE : $first"
+        }
+        return $null
+    } catch {
+        return $_.Exception.Message
+    } finally {
+        if ($null -eq $old) { Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
+        else { $env:CLAUDE_CONFIG_DIR = $old }
+    }
+}
+
+# Decide what (if anything) to warm. Returns a report object; acts only when
+# -Act is given, so 'warm-status' can show the decision without spending quota.
+function Invoke-WarmCycle {
+    param([switch]$Act)
+
+    $now   = Get-NowEpoch
+    $map   = Get-ProfileMap
+    $cool  = Get-Cooldowns
+    $warm  = Get-WarmState
+    $lines = @()
+    $chosen = $null
+
+    if ($map.Count -eq 0) { return [pscustomobject]@{ Chosen = $null; Lines = @('no saved profiles') } }
+
+    # Courtesy idle gate. Warming no longer switches accounts or closes the app,
+    # so this is preference rather than safety; 0 disables it.
+    if ($WarmIdleMinutes -gt 0) {
+        $idle = Get-IdleSeconds
+        if ($idle -lt ($WarmIdleMinutes * 60)) {
+            return [pscustomobject]@{ Chosen = $null; Lines = @("active $([int]($idle/60))m ago - waiting for $WarmIdleMinutes min idle") }
+        }
+    }
+
+    # Stagger: keep the windows from opening (and expiring) together.
+    $lastAny = 0
+    foreach ($v in $warm.Values) { if ([int64]$v -gt $lastAny) { $lastAny = [int64]$v } }
+    if ($lastAny -gt 0 -and ($now - $lastAny) -lt ($WarmStaggerMinutes * 60)) {
+        $wait = [int](($WarmStaggerMinutes * 60 - ($now - $lastAny)) / 60)
+        return [pscustomobject]@{ Chosen = $null; Lines = @("staggering - next warm in ~$wait min") }
+    }
+
+    $cands = @()
+    foreach ($name in ($map.Keys | Sort-Object)) {
+        $uuid = $map[$name]
+        if ($cool.ContainsKey($uuid) -and [int64]$cool[$uuid] -gt $now) {
+            $lines += "$name : rate limited until $(Format-Epoch $cool[$uuid]) - skip"
+            continue
+        }
+        $since = Get-WindowOpenSince -Uuid $uuid -WarmState $warm
+        if ($since -gt 0 -and ($now - $since) -lt $FiveHourSeconds) {
+            $lines += "$name : window open (active $([int](($now-$since)/60))m ago) - skip"
+            continue
+        }
+        $lines += "$name : window closed - candidate"
+        $cands += [pscustomobject]@{ Name = $name; Uuid = $uuid; Since = $since }
+    }
+
+    if ($cands.Count -eq 0) { return [pscustomobject]@{ Chosen = $null; Lines = $lines } }
+
+    # Neediest first: the account idle longest.
+    $chosen = $cands | Sort-Object Since | Select-Object -First 1
+
+    if (-not $Act) {
+        $lines += "would warm: $($chosen.Name)"
+        return [pscustomobject]@{ Chosen = $chosen; Lines = $lines }
+    }
+
+    $st = Get-WarmCliStatus $chosen.Name
+    if (-not $st.Ok) {
+        $lines += "cannot warm $($chosen.Name): $($st.Reason)"
+        Write-Log "warm: cannot warm '$($chosen.Name)' - $($st.Reason)" 'Yellow'
+        return [pscustomobject]@{ Chosen = $null; Lines = $lines }
+    }
+
+    Write-Log "warm: priming '$($chosen.Name)' ($($st.Email)) - window closed" 'Cyan'
+    $err = Invoke-WarmAccount $chosen.Name
+    if ($err) {
+        Write-Log "warm: FAILED for '$($chosen.Name)' - $err" 'Red'
+        $lines += "failed: $err"
+        return [pscustomobject]@{ Chosen = $null; Lines = $lines }
+    }
+
+    $warm[$chosen.Uuid] = $now
+    Set-WarmState $warm
+    Write-Log "warm: '$($chosen.Name)' primed - 5-hour window now open" 'Green'
+    $lines += "warmed: $($chosen.Name)"
+    return [pscustomobject]@{ Chosen = $chosen; Lines = $lines }
 }
 
 # --- Session copy ------------------------------------------------------------
@@ -599,6 +857,75 @@ switch ($Command) {
         Write-Host "Cleared all cooldowns." -ForegroundColor Green
     }
 
+    'warm-status' {
+        # Show the decision without spending any quota.
+        Write-Host ""
+        $cli = Get-ClaudeCliPath
+        Write-Host "  CLI          : $(if ($cli) { $cli } else { '<not found>' })" -ForegroundColor Cyan
+        Write-Host "  Config root  : $WarmRoot"
+        Write-Host "  Idle now     : $([int]((Get-IdleSeconds)/60)) min   (gate: $WarmIdleMinutes min)"
+        Write-Host "  Stagger      : $WarmStaggerMinutes min"
+        Write-Host ""
+        Write-Host "  Per-account CLI login:"
+        foreach ($n in ((Get-ProfileMap).Keys | Sort-Object)) {
+            $s = Get-WarmCliStatus $n
+            $who = if ($s.Email) { $s.Email } else { $s.Reason }
+            $col = if ($s.Ok) { 'Gray' } else { 'Yellow' }
+            Write-Host ("    {0,-12} {1}" -f $n, $who) -ForegroundColor $col
+        }
+        Write-Host ""
+        Write-Host "  Decision:"
+        $r = Invoke-WarmCycle
+        foreach ($l in $r.Lines) { Write-Host "    $l" }
+        if (-not $WarmWindows) { Write-Host "    (warming is OFF - add -WarmWindows to enable)" -ForegroundColor DarkGray }
+        Write-Host ""
+    }
+
+    'warm-login' {
+        if (-not $Name) { throw "Usage: .\claude-autoswitch.ps1 warm-login <profile>" }
+        if (-not (Get-ProfileMap).ContainsKey($Name)) { throw "No saved profile named '$Name'." }
+        $cli = Get-ClaudeCliPath
+        if (-not $cli) { throw "Bundled Claude Code CLI not found under $AppRoot\claude-code." }
+        $cfg = Get-WarmConfigDir $Name
+        New-Item -ItemType Directory -Path $cfg -Force | Out-Null
+        Write-Host ""
+        Write-Host "  Signing the CLI in for profile '$Name'." -ForegroundColor Cyan
+        Write-Host "  Config dir: $cfg" -ForegroundColor DarkGray
+        Write-Host "  Sign in as the account this profile holds - a browser window will open." -ForegroundColor Yellow
+        Write-Host ""
+        $old = $env:CLAUDE_CONFIG_DIR
+        try {
+            $env:CLAUDE_CONFIG_DIR = $cfg
+            & $cli auth login --claudeai
+        } finally {
+            if ($null -eq $old) { Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
+            else { $env:CLAUDE_CONFIG_DIR = $old }
+        }
+        $s = Get-WarmCliStatus $Name
+        Write-Host ""
+        if ($s.Ok) { Write-Host "  Logged in as $($s.Email) for profile '$Name'." -ForegroundColor Green }
+        else { Write-Host "  Still not logged in ($($s.Reason))." -ForegroundColor Red }
+        Write-Host ""
+    }
+
+    'warm-now' {
+        # Manual one-shot: prime a specific profile immediately, bypassing the
+        # idle/stagger gates but still honouring the CLI login check.
+        if (-not $Name) { throw "Usage: .\claude-autoswitch.ps1 warm-now <profile>" }
+        $map = Get-ProfileMap
+        if (-not $map.ContainsKey($Name)) { throw "No saved profile named '$Name'." }
+        $s = Get-WarmCliStatus $Name
+        if (-not $s.Ok) { throw "CLI is not signed in for '$Name' ($($s.Reason)). Run: warm-login $Name" }
+        Write-Host ""
+        Write-Host "  Priming '$Name' ($($s.Email))..." -ForegroundColor Cyan
+        $err = Invoke-WarmAccount $Name
+        if ($err) { Write-Host "  FAILED: $err" -ForegroundColor Red; exit 1 }
+        $w = Get-WarmState; $w[$map[$Name]] = Get-NowEpoch; Set-WarmState $w
+        Write-Log "warm: '$Name' primed manually" 'Green'
+        Write-Host "  Done - 5-hour window open for $($s.Email)." -ForegroundColor Green
+        Write-Host ""
+    }
+
     'selftest' {
         # Prove the detection + classification path is intact after any edit,
         # without waiting for a real limit. Runs the parser against synthetic
@@ -748,6 +1075,13 @@ switch ($Command) {
         if ($IncludeFiveHour) { $a += ' -IncludeFiveHour' }
         if ($IncludeFiveHour -and $MinFiveHourWaitMinutes -ne 30) { $a += " -MinFiveHourWaitMinutes $MinFiveHourWaitMinutes" }
         if ($CarryOverMinutes -ne 60) { $a += " -CarryOverMinutes $CarryOverMinutes" }
+        if ($WarmWindows) {
+            $a += ' -WarmWindows'
+            if ($WarmIdleMinutes    -ne 20)  { $a += " -WarmIdleMinutes $WarmIdleMinutes" }
+            if ($WarmStaggerMinutes -ne 150) { $a += " -WarmStaggerMinutes $WarmStaggerMinutes" }
+            if ($WarmCheckMinutes   -ne 10)  { $a += " -WarmCheckMinutes $WarmCheckMinutes" }
+            if ($WarmModel)                  { $a += " -WarmModel $WarmModel" }
+        }
         if ($IntervalSeconds -ne 5) { $a += " -IntervalSeconds $IntervalSeconds" }
 
         $sc.Arguments        = $a
@@ -820,7 +1154,11 @@ switch ($Command) {
         foreach ($f in $seed) { $offsets[$f.FullName] = $f.Length }
 
         Write-Log "Watching $($offsets.Count) transcript(s). Live account: $(Get-LiveAccountUuid)"
+        if ($WarmWindows) {
+            Write-Log "Window warming ON - idle gate $WarmIdleMinutes min, stagger $WarmStaggerMinutes min, checked every $WarmCheckMinutes min" 'Cyan'
+        }
         $lastBeat = Get-NowEpoch
+        $lastWarmCheck = Get-NowEpoch
 
         while ($true) {
             Start-Sleep -Seconds $IntervalSeconds
@@ -838,6 +1176,11 @@ switch ($Command) {
                     Write-Log "The switcher scripts changed on disk - this watcher is running OLD code. Restart it (Stop then Start, or re-login) to pick up the update." 'Yellow'
                     Show-Toast 'Claude switcher: watcher is out of date' 'The scripts were updated. Restart the watcher to run the new version.'
                 }
+            }
+
+            if ($WarmWindows -and ((Get-NowEpoch) - $lastWarmCheck) -ge ($WarmCheckMinutes * 60)) {
+                $lastWarmCheck = Get-NowEpoch
+                [void](Invoke-WarmCycle -Act)
             }
 
             foreach ($f in Get-TranscriptFiles) {
