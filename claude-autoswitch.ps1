@@ -41,7 +41,7 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet('run', 'stop', 'status', 'reset', 'test', 'selftest', 'install-startup', 'uninstall-startup',
-                 'warm-status', 'warm-login', 'warm-now')]
+                 'warm-status', 'warm-login', 'warm-logout', 'warm-now')]
     [string]$Command = 'status',
 
     # Second positional argument, used by warm-login / warm-now.
@@ -349,6 +349,23 @@ function Get-WindowOpenSince {
     return $a
 }
 
+# The org a profile's account actually belongs to, derived from the session index
+# (claude-code-sessions/<accountUuid>/<orgUuid>/). Factual, unlike the frozen
+# email in claude.json.
+function Get-ProfileOrgUuid {
+    param([string]$ProfileName)
+    $map = Get-ProfileMap
+    if (-not $map.ContainsKey($ProfileName)) { return $null }
+    $dir = Join-Path $SessionsRoot $map[$ProfileName]
+    if (-not (Test-Path $dir)) { return $null }
+    $best = $null; $bestN = -1
+    foreach ($org in Get-ChildItem $dir -Directory -ErrorAction SilentlyContinue) {
+        $n = @(Get-ChildItem $org.FullName -Filter 'local_*.json' -ErrorAction SilentlyContinue).Count
+        if ($n -gt $bestN) { $bestN = $n; $best = $org.Name }
+    }
+    return $best
+}
+
 function Get-WarmCliStatus {
     param([string]$ProfileName)
     $cli = Get-ClaudeCliPath
@@ -361,7 +378,20 @@ function Get-WarmCliStatus {
         $j = $null
         try { $j = $raw | ConvertFrom-Json } catch { }
         if (-not $j) { return [pscustomobject]@{ Ok = $false; Reason = 'could not read auth status' } }
-        return [pscustomobject]@{ Ok = [bool]$j.loggedIn; Email = $j.email; Reason = $(if ($j.loggedIn) { 'ok' } else { 'not logged in' }) }
+        if (-not $j.loggedIn) { return [pscustomobject]@{ Ok = $false; Email = $null; Reason = 'not logged in' } }
+
+        # Guard: the browser may still hold a session for the OTHER account and
+        # silently approve that one. Signing a profile's config dir into the
+        # wrong account would warm one account twice and never touch the other,
+        # so treat a mismatch as not-usable rather than letting it through.
+        $wantOrg = Get-ProfileOrgUuid $ProfileName
+        if ($wantOrg -and $j.orgId -and $j.orgId -ne $wantOrg) {
+            return [pscustomobject]@{
+                Ok = $false; Email = $j.email
+                Reason = "WRONG ACCOUNT - signed in as $($j.email) but this profile is a different account"
+            }
+        }
+        return [pscustomobject]@{ Ok = $true; Email = $j.email; Reason = 'ok' }
     } finally {
         if ($null -eq $old) { Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
         else { $env:CLAUDE_CONFIG_DIR = $old }
@@ -869,8 +899,10 @@ switch ($Command) {
         Write-Host "  Per-account CLI login:"
         foreach ($n in ((Get-ProfileMap).Keys | Sort-Object)) {
             $s = Get-WarmCliStatus $n
-            $who = if ($s.Email) { $s.Email } else { $s.Reason }
-            $col = if ($s.Ok) { 'Gray' } else { 'Yellow' }
+            # Show the reason whenever it is not usable - a wrong-account login
+            # still reports an email, and showing only that hides the problem.
+            $who = if ($s.Ok) { $s.Email } else { $s.Reason }
+            $col = if ($s.Ok) { 'Gray' } elseif ($s.Reason -like 'WRONG ACCOUNT*') { 'Red' } else { 'Yellow' }
             Write-Host ("    {0,-12} {1}" -f $n, $who) -ForegroundColor $col
         }
         Write-Host ""
@@ -903,9 +935,39 @@ switch ($Command) {
         }
         $s = Get-WarmCliStatus $Name
         Write-Host ""
-        if ($s.Ok) { Write-Host "  Logged in as $($s.Email) for profile '$Name'." -ForegroundColor Green }
-        else { Write-Host "  Still not logged in ($($s.Reason))." -ForegroundColor Red }
+        if ($s.Ok) {
+            Write-Host "  Logged in as $($s.Email) for profile '$Name'." -ForegroundColor Green
+        } elseif ($s.Reason -like 'WRONG ACCOUNT*') {
+            Write-Host "  $($s.Reason)." -ForegroundColor Red
+            Write-Host ""
+            Write-Host "  Your browser was already signed in as that account, so the flow" -ForegroundColor Yellow
+            Write-Host "  approved it without asking. To fix:" -ForegroundColor Yellow
+            Write-Host "    1. .\claude-autoswitch.ps1 warm-logout $Name" -ForegroundColor Yellow
+            Write-Host "    2. sign out of claude.ai in your browser (or use a private window)" -ForegroundColor Yellow
+            Write-Host "    3. .\claude-autoswitch.ps1 warm-login $Name" -ForegroundColor Yellow
+        } else {
+            Write-Host "  Still not logged in ($($s.Reason))." -ForegroundColor Red
+        }
         Write-Host ""
+    }
+
+    'warm-logout' {
+        if (-not $Name) { throw "Usage: .\claude-autoswitch.ps1 warm-logout <profile>" }
+        $cfg = Get-WarmConfigDir $Name
+        if (-not (Test-Path $cfg)) { Write-Host "No CLI config dir for '$Name'." -ForegroundColor Yellow; break }
+        $cli = Get-ClaudeCliPath
+        $old = $env:CLAUDE_CONFIG_DIR
+        try {
+            $env:CLAUDE_CONFIG_DIR = $cfg
+            if ($cli) { & $cli auth logout 2>&1 | Out-Null }
+        } finally {
+            if ($null -eq $old) { Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
+            else { $env:CLAUDE_CONFIG_DIR = $old }
+        }
+        # Remove the credential outright so a re-login cannot silently reuse it.
+        Remove-Item (Join-Path $cfg '.credentials.json') -Force -ErrorAction SilentlyContinue
+        $s = Get-WarmCliStatus $Name
+        Write-Host "Signed '$Name' out (now: $($s.Reason))." -ForegroundColor Green
     }
 
     'warm-now' {
