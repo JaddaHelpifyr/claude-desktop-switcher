@@ -224,6 +224,7 @@ function Add-Output {
 function Invoke-Tool {
     param([string]$Script, [string[]]$Arguments, [hashtable]$Named)
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    $script:Busy = $true          # keep the auto-refresh timer out of the way
     try {
         if ($null -eq $Named) { $Named = @{} }
         $res = & $Script @Arguments @Named *>&1 | Out-String
@@ -231,6 +232,7 @@ function Invoke-Tool {
     } catch {
         Add-Output ("ERROR: " + $_.Exception.Message)
     } finally {
+        $script:Busy = $false
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
 }
@@ -525,6 +527,12 @@ function Update-All {
     }
     $lblCooldown.Text = $cdText
 
+    # Baseline for the auto-refresh timer, so it only fires on a change made
+    # outside this window (e.g. the watcher failing over) rather than after
+    # every refresh we do ourselves.
+    $script:LastSeenUuid    = $live
+    $script:LastSeenWatcher = $running
+
     Update-Sessions
 }
 
@@ -799,5 +807,38 @@ if (Test-Path $StartupLnk) {
 }
 
 Update-All
+
+# The watcher switches accounts from a separate process, so without this the
+# Accounts tab keeps showing the old account (green dot on the one that just hit
+# its limit) until Refresh is pressed. Poll only the two cheap authoritative
+# signals - the live account UUID and the watcher mutex - and do a full refresh
+# only when one of them actually changed. A full Update-All every few seconds
+# would re-enumerate every transcript, which is far too heavy.
+$script:Busy = $false
+$refreshTimer          = New-Object System.Windows.Forms.Timer
+$refreshTimer.Interval = 3000
+$refreshTimer.Add_Tick({
+    if ($script:Busy) { return }
+    try {
+        $u = Get-LiveUuid
+        $w = Test-WatcherRunning
+        if ($u -ne $script:LastSeenUuid -or $w -ne $script:LastSeenWatcher) {
+            $wasUuid = $script:LastSeenUuid
+            Update-All          # this also re-baselines LastSeen*
+            if ($u -ne $wasUuid) {
+                $who = $null
+                foreach ($p in $script:Profiles) { if ($p.Uuid -eq $u) { $who = $p.Label } }
+                if (-not $who) { $who = Get-ShortUuid $u }
+                Add-Output "Account changed outside this window - now on $who."
+            } else {
+                Add-Output 'Watcher state changed - refreshed.'
+            }
+        }
+    } catch { }   # never let a transient read kill the timer
+})
+$refreshTimer.Start()
+
 Add-Output 'Ready. Switching and saving both close Claude briefly.'
 [void]$form.ShowDialog()
+$refreshTimer.Stop()
+$refreshTimer.Dispose()
