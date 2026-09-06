@@ -435,10 +435,10 @@ $lvWarm.FullRowSelect = $true
 $lvWarm.MultiSelect = $false
 $lvWarm.GridLines   = $true
 $lvWarm.Anchor      = 'Top,Bottom,Left,Right'
-[void]$lvWarm.Columns.Add('Profile', 100)
-[void]$lvWarm.Columns.Add('CLI signed in as', 260)
-[void]$lvWarm.Columns.Add('Window', 120)
-[void]$lvWarm.Columns.Add('Last warmed', 130)
+[void]$lvWarm.Columns.Add('Profile', 90)
+[void]$lvWarm.Columns.Add('CLI signed in as', 215)
+[void]$lvWarm.Columns.Add('Window', 215)
+[void]$lvWarm.Columns.Add('Last warmed', 110)
 $tabWarm.Controls.Add($lvWarm)
 
 $warmButtons = @(
@@ -710,9 +710,19 @@ function Update-Warm {
 
         foreach ($p in $script:Profiles) {
             $cli = if ($status.ContainsKey($p.Name)) { $status[$p.Name] } else { '<unknown>' }
+            # warm-status phrasing is written for a console; render it compactly
+            # here so the column reads at a glance instead of truncating.
             $win = '?'
             foreach ($d in $decision) {
-                if ($d -match "^$([regex]::Escape($p.Name))\s*:\s*(.+)$") { $win = $Matches[1] }
+                if ($d -match "^$([regex]::Escape($p.Name))\s*:\s*(.+)$") {
+                    $raw = $Matches[1]
+                    $win = switch -Regex ($raw) {
+                        'window open \(active (.+?)\)' { "open - last used $($Matches[1])"; break }
+                        'window closed'                { 'CLOSED - will warm';             break }
+                        'rate limited until (.+?) -'   { "rate limited until $($Matches[1])"; break }
+                        default                        { $raw }
+                    }
+                }
             }
             $warmed = ''
             try {
