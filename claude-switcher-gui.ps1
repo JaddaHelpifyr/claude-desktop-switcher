@@ -367,6 +367,105 @@ $tabWatcher           = New-Object System.Windows.Forms.TabPage
 $tabWatcher.Text      = 'Auto-switch'
 $tabs.Controls.Add($tabWatcher)
 
+# =============================== Tab: Warming ================================
+
+$tabWarm            = New-Object System.Windows.Forms.TabPage
+$tabWarm.Text       = 'Warming'
+$tabs.Controls.Add($tabWarm)
+
+$lblWarmIntro          = New-Object System.Windows.Forms.Label
+$lblWarmIntro.Location = New-Object System.Drawing.Point(12, 10)
+$lblWarmIntro.Size     = New-Object System.Drawing.Size(870, 34)
+$lblWarmIntro.ForeColor = [System.Drawing.Color]::DimGray
+$lblWarmIntro.Text     = "A 5-hour window opens on first use. Warming sends one tiny prompt per account so the window is already ticking when you sit down." +
+                         "`r`nIt runs headlessly as each account, so it never switches accounts or interrupts what you are doing."
+$tabWarm.Controls.Add($lblWarmIntro)
+
+$chkWarm            = New-Object System.Windows.Forms.CheckBox
+$chkWarm.Text       = 'Keep usage windows warm'
+$chkWarm.Location   = New-Object System.Drawing.Point(12, 50)
+$chkWarm.Size       = New-Object System.Drawing.Size(220, 24)
+$tabWarm.Controls.Add($chkWarm)
+
+$lblWarmIdle        = New-Object System.Windows.Forms.Label
+$lblWarmIdle.Text   = 'only when idle for'
+$lblWarmIdle.Location = New-Object System.Drawing.Point(240, 54)
+$lblWarmIdle.Size   = New-Object System.Drawing.Size(110, 20)
+$tabWarm.Controls.Add($lblWarmIdle)
+
+$numWarmIdle        = New-Object System.Windows.Forms.NumericUpDown
+$numWarmIdle.Location = New-Object System.Drawing.Point(352, 50)
+$numWarmIdle.Size   = New-Object System.Drawing.Size(55, 24)
+$numWarmIdle.Minimum = 0
+$numWarmIdle.Maximum = 600
+$numWarmIdle.Value  = 20
+$tabWarm.Controls.Add($numWarmIdle)
+
+$lblWarmIdle2       = New-Object System.Windows.Forms.Label
+$lblWarmIdle2.Text  = 'min (0 = any time)'
+$lblWarmIdle2.Location = New-Object System.Drawing.Point(412, 54)
+$lblWarmIdle2.Size  = New-Object System.Drawing.Size(120, 20)
+$tabWarm.Controls.Add($lblWarmIdle2)
+
+$lblWarmStag        = New-Object System.Windows.Forms.Label
+$lblWarmStag.Text   = 'stagger accounts by'
+$lblWarmStag.Location = New-Object System.Drawing.Point(540, 54)
+$lblWarmStag.Size   = New-Object System.Drawing.Size(120, 20)
+$tabWarm.Controls.Add($lblWarmStag)
+
+$numWarmStag        = New-Object System.Windows.Forms.NumericUpDown
+$numWarmStag.Location = New-Object System.Drawing.Point(662, 50)
+$numWarmStag.Size   = New-Object System.Drawing.Size(60, 24)
+$numWarmStag.Minimum = 0
+$numWarmStag.Maximum = 600
+$numWarmStag.Value  = 150
+$tabWarm.Controls.Add($numWarmStag)
+
+$lblWarmStag2       = New-Object System.Windows.Forms.Label
+$lblWarmStag2.Text  = 'min'
+$lblWarmStag2.Location = New-Object System.Drawing.Point(728, 54)
+$lblWarmStag2.Size  = New-Object System.Drawing.Size(40, 20)
+$tabWarm.Controls.Add($lblWarmStag2)
+
+$lvWarm             = New-Object System.Windows.Forms.ListView
+$lvWarm.Location    = New-Object System.Drawing.Point(12, 86)
+$lvWarm.Size        = New-Object System.Drawing.Size(640, 250)
+$lvWarm.View        = 'Details'
+$lvWarm.FullRowSelect = $true
+$lvWarm.MultiSelect = $false
+$lvWarm.GridLines   = $true
+$lvWarm.Anchor      = 'Top,Bottom,Left,Right'
+[void]$lvWarm.Columns.Add('Profile', 100)
+[void]$lvWarm.Columns.Add('CLI signed in as', 260)
+[void]$lvWarm.Columns.Add('Window', 120)
+[void]$lvWarm.Columns.Add('Last warmed', 130)
+$tabWarm.Controls.Add($lvWarm)
+
+$warmButtons = @(
+    @{ Text = 'Refresh';      Y = 86;  Name = 'refresh' },
+    @{ Text = 'Warm now';     Y = 124; Name = 'now'     },
+    @{ Text = 'Sign in...';   Y = 168; Name = 'login'   },
+    @{ Text = 'Sign out';     Y = 206; Name = 'logout'  }
+)
+$warmBtn = @{}
+foreach ($b in $warmButtons) {
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text = $b.Text
+    $btn.Location = New-Object System.Drawing.Point(664, $b.Y)
+    $btn.Size = New-Object System.Drawing.Size(212, 30)
+    $btn.Anchor = 'Top,Right'
+    $tabWarm.Controls.Add($btn)
+    $warmBtn[$b.Name] = $btn
+}
+
+$lblWarmHint          = New-Object System.Windows.Forms.Label
+$lblWarmHint.Location = New-Object System.Drawing.Point(664, 246)
+$lblWarmHint.Size     = New-Object System.Drawing.Size(212, 90)
+$lblWarmHint.Anchor   = 'Top,Right'
+$lblWarmHint.ForeColor = [System.Drawing.Color]::DimGray
+$lblWarmHint.Text     = "Each account needs its own one-time sign-in. If your browser is already signed into the other account, use a private window."
+$tabWarm.Controls.Add($lblWarmHint)
+
 $lblWatch             = New-Object System.Windows.Forms.Label
 $lblWatch.Location    = New-Object System.Drawing.Point(12, 14)
 $lblWatch.Size        = New-Object System.Drawing.Size(620, 24)
@@ -411,15 +510,35 @@ $lblMinWait2.Location = New-Object System.Drawing.Point(636, 142)
 $lblMinWait2.Size     = New-Object System.Drawing.Size(70, 20)
 $tabWatcher.Controls.Add($lblMinWait2)
 
+$lblCarry             = New-Object System.Windows.Forms.Label
+$lblCarry.Text        = 'On failover, carry over sessions touched in the last'
+$lblCarry.Location    = New-Object System.Drawing.Point(12, 168)
+$lblCarry.Size        = New-Object System.Drawing.Size(300, 20)
+$tabWatcher.Controls.Add($lblCarry)
+
+$numCarry             = New-Object System.Windows.Forms.NumericUpDown
+$numCarry.Location    = New-Object System.Drawing.Point(316, 164)
+$numCarry.Size        = New-Object System.Drawing.Size(60, 24)
+$numCarry.Minimum     = 5
+$numCarry.Maximum     = 1440
+$numCarry.Value       = 60
+$tabWatcher.Controls.Add($numCarry)
+
+$lblCarry2            = New-Object System.Windows.Forms.Label
+$lblCarry2.Text       = 'min'
+$lblCarry2.Location   = New-Object System.Drawing.Point(382, 168)
+$lblCarry2.Size       = New-Object System.Drawing.Size(40, 20)
+$tabWatcher.Controls.Add($lblCarry2)
+
 $watchButtons = @(
-    @{ Text = 'Start watcher';        X = 12;  Y = 176; Name = 'start'    },
-    @{ Text = 'Stop watcher';         X = 176; Y = 176; Name = 'stop'     },
-    @{ Text = 'Run on login';         X = 12;  Y = 214; Name = 'install'  },
-    @{ Text = "Don't run on login";   X = 176; Y = 214; Name = 'uninstall'},
-    @{ Text = 'Open log';             X = 12;  Y = 258; Name = 'log'      },
-    @{ Text = 'Clear cooldowns';      X = 176; Y = 258; Name = 'reset'    },
-    @{ Text = 'Replay past limits';   X = 340; Y = 258; Name = 'test'     },
-    @{ Text = 'Self-test';            X = 340; Y = 214; Name = 'selftest' }
+    @{ Text = 'Start watcher';        X = 12;  Y = 206; Name = 'start'    },
+    @{ Text = 'Stop watcher';         X = 176; Y = 206; Name = 'stop'     },
+    @{ Text = 'Run on login';         X = 12;  Y = 244; Name = 'install'  },
+    @{ Text = "Don't run on login";   X = 176; Y = 244; Name = 'uninstall'},
+    @{ Text = 'Open log';             X = 12;  Y = 288; Name = 'log'      },
+    @{ Text = 'Clear cooldowns';      X = 176; Y = 288; Name = 'reset'    },
+    @{ Text = 'Replay past limits';   X = 340; Y = 288; Name = 'test'     },
+    @{ Text = 'Self-test';            X = 340; Y = 244; Name = 'selftest' }
 )
 $watchBtn = @{}
 foreach ($b in $watchButtons) {
@@ -564,7 +683,120 @@ function Update-Sessions {
 
 # --- Wiring ------------------------------------------------------------------
 
-$btnRefresh.Add_Click({ Update-All })
+# Warming rows are expensive: each one shells out to claude.exe for auth status.
+# So this refreshes only on demand (tab selected, Refresh, or after an action) --
+# never from the 3s auto-refresh timer.
+function Update-Warm {
+    $lvWarm.Items.Clear()
+    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        $out = & $AutoScript warm-status *>&1 | Out-String
+        $lines = $out -split "`r?`n"
+        $inList = $false
+        $status = @{}
+        foreach ($l in $lines) {
+            if ($l -match 'Per-account CLI login:') { $inList = $true; continue }
+            if ($inList) {
+                if ($l -match '^\s*$') { $inList = $false; continue }
+                if ($l -match '^\s{4}(\S+)\s+(.+?)\s*$') { $status[$Matches[1]] = $Matches[2] }
+            }
+        }
+        $decision = @()
+        $inDec = $false
+        foreach ($l in $lines) {
+            if ($l -match '^\s*Decision:') { $inDec = $true; continue }
+            if ($inDec -and $l.Trim()) { $decision += $l.Trim() }
+        }
+
+        foreach ($p in $script:Profiles) {
+            $cli = if ($status.ContainsKey($p.Name)) { $status[$p.Name] } else { '<unknown>' }
+            $win = '?'
+            foreach ($d in $decision) {
+                if ($d -match "^$([regex]::Escape($p.Name))\s*:\s*(.+)$") { $win = $Matches[1] }
+            }
+            $warmed = ''
+            try {
+                $ws = Get-Content (Join-Path $Store 'autoswitch-warm.json') -Raw | ConvertFrom-Json
+                $v = $ws.PSObject.Properties[$p.Uuid]
+                if ($v) { $warmed = ([DateTimeOffset]::FromUnixTimeSeconds([int64]$v.Value).LocalDateTime).ToString('MM-dd HH:mm') }
+            } catch { }
+
+            $it = New-Object System.Windows.Forms.ListViewItem($p.Name)
+            [void]$it.SubItems.Add($cli)
+            [void]$it.SubItems.Add($win)
+            [void]$it.SubItems.Add($warmed)
+            $it.Tag = $p
+            if ($cli -like 'WRONG ACCOUNT*') { $it.ForeColor = [System.Drawing.Color]::Firebrick }
+            elseif ($cli -like 'not logged in*') { $it.ForeColor = [System.Drawing.Color]::DarkGoldenrod }
+            [void]$lvWarm.Items.Add($it)
+        }
+    } catch {
+        Add-Output ("warming status failed: " + $_.Exception.Message)
+    } finally {
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+}
+
+function Get-SelectedWarmProfile {
+    if ($lvWarm.SelectedItems.Count -eq 0) {
+        [void][System.Windows.Forms.MessageBox]::Show('Select an account first.', 'Claude Switcher', 'OK', 'Information')
+        return $null
+    }
+    return $lvWarm.SelectedItems[0].Tag
+}
+
+$btnRefresh.Add_Click({ Update-All; if ($tabs.SelectedTab -eq $tabWarm) { Update-Warm } })
+
+# Populate the warming tab the first time it is opened, not on every refresh.
+$script:WarmLoaded = $false
+$tabs.Add_SelectedIndexChanged({
+    if ($tabs.SelectedTab -eq $tabWarm -and -not $script:WarmLoaded) {
+        $script:WarmLoaded = $true
+        Update-Warm
+    }
+})
+
+$warmBtn['refresh'].Add_Click({ Update-Warm })
+
+$warmBtn['now'].Add_Click({
+    $p = Get-SelectedWarmProfile
+    if (-not $p) { return }
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "Send a warm-up prompt as '$($p.Name)' now?`n`nThis spends a small amount of that account's quota and opens its 5-hour window.",
+        'Claude Switcher', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+    Invoke-Tool $AutoScript @('warm-now', $p.Name)
+    Update-Warm
+})
+
+$warmBtn['login'].Add_Click({
+    $p = Get-SelectedWarmProfile
+    if (-not $p) { return }
+    [void][System.Windows.Forms.MessageBox]::Show(
+        ("A console window will open to sign in for '$($p.Name)'.`n`n" +
+         "Sign in as the account this profile holds. If your browser is already signed " +
+         "into the other account it will approve that one instead - use a private window " +
+         "with the URL the console prints.`n`n" +
+         "If you are given a code, paste it into that console window."),
+        'Sign in for warming', 'OK', 'Information')
+    # A visible console: the CLI may prompt for a pasted code, which needs stdin.
+    Start-Process powershell.exe -ArgumentList @(
+        '-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-Command',
+        "cd '$ScriptDir'; .\claude-autoswitch.ps1 warm-login $($p.Name)"
+    ) -WindowStyle Normal
+    Add-Output "Opened a sign-in window for '$($p.Name)'. Press Refresh here when it finishes."
+})
+
+$warmBtn['logout'].Add_Click({
+    $p = Get-SelectedWarmProfile
+    if (-not $p) { return }
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "Sign the CLI out for '$($p.Name)'?`n`nWarming will stop working for that account until you sign in again.",
+        'Claude Switcher', 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+    Invoke-Tool $AutoScript @('warm-logout', $p.Name)
+    Update-Warm
+})
 $cbAccount.Add_SelectedIndexChanged({ Update-Sessions })
 
 function Get-SelectedProfile {
@@ -722,6 +954,12 @@ $watchBtn['start'].Add_Click({
     $a = @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$AutoScript,'run')
     if ($chkDryRun.Checked)   { $a += '-DryRun' }
     if ($chkFiveHour.Checked) { $a += '-IncludeFiveHour'; $a += '-MinFiveHourWaitMinutes'; $a += [string][int]$numMinWait.Value }
+    $a += '-CarryOverMinutes'; $a += [string][int]$numCarry.Value
+    if ($chkWarm.Checked) {
+        $a += '-WarmWindows'
+        $a += '-WarmIdleMinutes';    $a += [string][int]$numWarmIdle.Value
+        $a += '-WarmStaggerMinutes'; $a += [string][int]$numWarmStag.Value
+    }
     Start-Process powershell.exe -ArgumentList $a
     Add-Output 'Started watcher (hidden).'
     Start-Sleep -Milliseconds 1200
@@ -737,7 +975,21 @@ $watchBtn['install'].Add_Click({
     $n = @{}
     if ($chkDryRun.Checked)   { $n['DryRun'] = $true }
     if ($chkFiveHour.Checked) { $n['IncludeFiveHour'] = $true; $n['MinFiveHourWaitMinutes'] = [int]$numMinWait.Value }
+    $n['CarryOverMinutes'] = [int]$numCarry.Value
+    if ($chkWarm.Checked) {
+        $n['WarmWindows']        = $true
+        $n['WarmIdleMinutes']    = [int]$numWarmIdle.Value
+        $n['WarmStaggerMinutes'] = [int]$numWarmStag.Value
+    }
     Invoke-Tool $AutoScript @('install-startup') $n
+    # install-startup rewrites the shortcut, which drops the custom icon.
+    $ico = Join-Path $ScriptDir 'claude-switcher.ico'
+    if (Test-Path $ico) {
+        try {
+            $s = (New-Object -ComObject WScript.Shell).CreateShortcut($StartupLnk)
+            $s.IconLocation = "$ico,0"; $s.Save()
+        } catch { }
+    }
 })
 
 $watchBtn['uninstall'].Add_Click({ Invoke-Tool $AutoScript @('uninstall-startup') })
@@ -803,6 +1055,12 @@ if (Test-Path $StartupLnk) {
         $chkDryRun.Checked   = [bool]($sc.Arguments -match '-DryRun')
         $chkFiveHour.Checked = [bool]($sc.Arguments -match '-IncludeFiveHour')
         if ($sc.Arguments -match '-MinFiveHourWaitMinutes\s+(\d+)') { $numMinWait.Value = [int]$Matches[1] }
+        # Every flag must round-trip. Anything not read here is silently dropped
+        # the next time Start watcher or Run on login is pressed.
+        if ($sc.Arguments -match '-CarryOverMinutes\s+(\d+)')   { $numCarry.Value    = [int]$Matches[1] }
+        $chkWarm.Checked = [bool]($sc.Arguments -match '-WarmWindows')
+        if ($sc.Arguments -match '-WarmIdleMinutes\s+(\d+)')    { $numWarmIdle.Value = [int]$Matches[1] }
+        if ($sc.Arguments -match '-WarmStaggerMinutes\s+(\d+)') { $numWarmStag.Value = [int]$Matches[1] }
     } catch { }
 }
 

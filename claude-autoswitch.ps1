@@ -440,22 +440,31 @@ function Invoke-WarmCycle {
 
     if ($map.Count -eq 0) { return [pscustomobject]@{ Chosen = $null; Lines = @('no saved profiles') } }
 
+    # Evaluate the gates, but do NOT return early when only reporting: the
+    # per-account picture is the useful part, and hiding it behind a gate makes
+    # 'warm-status' far less informative than it should be.
+    $blocked = $null
+
     # Courtesy idle gate. Warming no longer switches accounts or closes the app,
     # so this is preference rather than safety; 0 disables it.
     if ($WarmIdleMinutes -gt 0) {
         $idle = Get-IdleSeconds
         if ($idle -lt ($WarmIdleMinutes * 60)) {
-            return [pscustomobject]@{ Chosen = $null; Lines = @("active $([int]($idle/60))m ago - waiting for $WarmIdleMinutes min idle") }
+            $blocked = "active $([int]($idle/60))m ago - waiting for $WarmIdleMinutes min idle"
         }
     }
 
     # Stagger: keep the windows from opening (and expiring) together.
-    $lastAny = 0
-    foreach ($v in $warm.Values) { if ([int64]$v -gt $lastAny) { $lastAny = [int64]$v } }
-    if ($lastAny -gt 0 -and ($now - $lastAny) -lt ($WarmStaggerMinutes * 60)) {
-        $wait = [int](($WarmStaggerMinutes * 60 - ($now - $lastAny)) / 60)
-        return [pscustomobject]@{ Chosen = $null; Lines = @("staggering - next warm in ~$wait min") }
+    if (-not $blocked) {
+        $lastAny = 0
+        foreach ($v in $warm.Values) { if ([int64]$v -gt $lastAny) { $lastAny = [int64]$v } }
+        if ($lastAny -gt 0 -and ($now - $lastAny) -lt ($WarmStaggerMinutes * 60)) {
+            $wait = [int](($WarmStaggerMinutes * 60 - ($now - $lastAny)) / 60)
+            $blocked = "staggering - next warm in ~$wait min"
+        }
     }
+
+    if ($blocked -and $Act) { return [pscustomobject]@{ Chosen = $null; Lines = @($blocked) } }
 
     $cands = @()
     foreach ($name in ($map.Keys | Sort-Object)) {
@@ -473,13 +482,17 @@ function Invoke-WarmCycle {
         $cands += [pscustomobject]@{ Name = $name; Uuid = $uuid; Since = $since }
     }
 
-    if ($cands.Count -eq 0) { return [pscustomobject]@{ Chosen = $null; Lines = $lines } }
+    if ($cands.Count -eq 0) {
+        if ($blocked) { $lines += $blocked }
+        return [pscustomobject]@{ Chosen = $null; Lines = $lines }
+    }
 
     # Neediest first: the account idle longest.
     $chosen = $cands | Sort-Object Since | Select-Object -First 1
 
     if (-not $Act) {
-        $lines += "would warm: $($chosen.Name)"
+        if ($blocked) { $lines += "$blocked (would otherwise warm: $($chosen.Name))" }
+        else          { $lines += "would warm: $($chosen.Name)" }
         return [pscustomobject]@{ Chosen = $chosen; Lines = $lines }
     }
 
