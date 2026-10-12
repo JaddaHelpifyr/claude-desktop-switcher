@@ -13,9 +13,10 @@ function Invoke-Sessions {
 }
 
 function Write-SessionIndex {
-    param([string]$Path, [string]$SessionId, [string]$CliId, [bool]$IncludeCliId = $true)
+    param([string]$Path, [string]$SessionId, [string]$CliId, [bool]$IncludeCliId = $true, [string]$SpawnedFromJson)
     $cliField = if ($IncludeCliId) { '"cliSessionId":"' + $CliId + '",' } else { '' }
-    $json = '{"sessionId":"' + $SessionId + '",' + $cliField + '"title":"Fixture ' + $SessionId + '","cwd":"C:\\fixture","lastActivityAt":1760000000000,"":null}'
+    $spawnedFromField = if ($SpawnedFromJson) { '"spawnedFrom":' + $SpawnedFromJson + ',' } else { '' }
+    $json = '{"sessionId":"' + $SessionId + '",' + $cliField + $spawnedFromField + '"title":"Fixture ' + $SessionId + '","cwd":"C:\\fixture","lastActivityAt":1760000000000,"":null}'
     [IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
@@ -66,7 +67,9 @@ try {
     Write-SessionIndex (Join-Path $sourceDir 'local_session-1.json') 'session-1' 'cli-one'
     Write-SessionIndex (Join-Path $sourceDir 'local_session-2.json') 'session-2' 'cli-missing'
     Write-SessionIndex (Join-Path $sourceDir 'local_session-3.json') 'session-3' '' $false
+    Write-SessionIndex (Join-Path $sourceDir 'local_session-4.json') 'session-4' 'cli-child' $true '{"sessionId":"session-1","sideSession":true,"name":"fixture-child"}'
     [IO.File]::WriteAllText((Join-Path (Join-Path (Join-Path $userProfile '.claude\projects') 'project-one') 'cli-one.jsonl'), '{"fixture":true}')
+    [IO.File]::WriteAllText((Join-Path (Join-Path (Join-Path $userProfile '.claude\projects') 'project-one') 'cli-child.jsonl'), '{"fixture":true}')
 
     $sourceHashes = @{}
     Get-ChildItem $sourceDir -Filter 'local_*.json' | ForEach-Object { $sourceHashes[$_.Name] = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
@@ -81,7 +84,7 @@ try {
 
     $list = Invoke-Sessions 'list' @('primary')
     Assert-True ($list.ExitCode -eq 0) "Session list exits 0: $($list.Output)"
-    Assert-True ($list.Output -match '3 session\(s\)') 'All three fixture sessions parse, including the empty JSON property name.'
+    Assert-True ($list.Output -match '4 session\(s\)') 'All fixture sessions parse, including empty JSON property names and side-session indexes.'
 
     $single = Invoke-Sessions 'copy' @('session-1', 'secundary')
     Assert-True ($single.ExitCode -eq 0) "Single-session copy exits 0: $($single.Output)"
@@ -98,9 +101,15 @@ try {
 
     $bulk = Invoke-Sessions 'copy-all' @('primary', 'secundary')
     Assert-True ($bulk.ExitCode -eq 0) "Bulk copy exits 0: $($bulk.Output)"
-    Assert-True ($bulk.Output -match 'Newly copied\s+: 2') 'Bulk copy adds the two missing entries.'
+    Assert-True ($bulk.Output -match 'Newly copied\s+: 3') 'Bulk copy adds the three missing entries.'
     Assert-True ($bulk.Output -match 'Already identical\s+: 1') 'Bulk copy skips an identical existing entry.'
+    Assert-True ($bulk.Output -match 'Side-session indexes\s+: 1') 'Bulk copy reports the side-session index count.'
+    Assert-True ($bulk.Output -match 'Side-session parents\s+: 1/1 resolved') 'Bulk copy verifies the side-session parent is present.'
     Assert-True ($bulk.Output -match 'Missing transcripts\s+: 2') 'Bulk copy reports entries without local transcripts.'
+    $childCopy = Get-Content -LiteralPath (Join-Path $targetDir 'local_session-4.json') -Raw
+    $childCopy = [regex]::Replace($childCopy, '(?<=[{,])\s*""(?=\s*:)', '"__claude_empty_property__"') | ConvertFrom-Json
+    Assert-True ($childCopy.spawnedFrom.sideSession -eq $true) 'Copied side-session metadata remains enabled.'
+    Assert-True ($childCopy.spawnedFrom.sessionId -eq 'session-1') 'Copied side-session metadata retains its parent reference.'
     foreach ($name in $sourceHashes.Keys) {
         $sourcePath = Join-Path $sourceDir $name
         Assert-True ((Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash -eq $sourceHashes[$name]) "Source index remains unchanged: $name"
@@ -110,9 +119,9 @@ try {
     $again = Invoke-Sessions 'copy-all' @('primary', 'secundary')
     Assert-True ($again.ExitCode -eq 0) "Repeated bulk copy exits 0: $($again.Output)"
     Assert-True ($again.Output -match 'Newly copied\s+: 0') 'Repeated bulk copy is idempotent.'
-    Assert-True ($again.Output -match 'Already identical\s+: 3') 'Repeated bulk copy skips all identical entries.'
+    Assert-True ($again.Output -match 'Already identical\s+: 4') 'Repeated bulk copy skips all identical entries.'
 
-    Write-Host 'PASS: PowerShell parsing, empty-key indexes, matching org copy, conflict preflight, byte verification, missing-transcript report, and idempotency.' -ForegroundColor Green
+    Write-Host 'PASS: PowerShell parsing, empty-key indexes, side-session parent preservation, matching org copy, conflict preflight, byte verification, missing-transcript report, and idempotency.' -ForegroundColor Green
 }
 finally {
     $env:APPDATA = $oldAppData

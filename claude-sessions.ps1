@@ -108,6 +108,7 @@ function Get-SessionRecords {
                 Title     = $j.title
                 Cwd       = $j.cwd
                 LastAt    = $j.lastActivityAt
+                SpawnedFrom = $j.spawnedFrom
                 Org       = $orgDir.Name
                 Path      = $f.FullName
             }
@@ -282,6 +283,17 @@ switch ($Command) {
         $srcRecs = @(Get-SessionRecords -AccountUuid $srcAccount -FailOnInvalid)
         if (-not $srcRecs) { throw "No session indexes found under source account $srcAccount." }
 
+        $sideSessionRecs = @($srcRecs | Where-Object { $_.SpawnedFrom -and $_.SpawnedFrom.sideSession -eq $true })
+        $sourceSessionIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($record in $srcRecs) {
+            if ($record.SessionId) { [void]$sourceSessionIds.Add(('{0}\{1}' -f $record.Org, $record.SessionId)) }
+        }
+        $sideSessionParentLinks = @($sideSessionRecs | Where-Object { $_.SpawnedFrom.sessionId })
+        $resolvedSideSessionParents = @($sideSessionParentLinks | Where-Object {
+            $parentKey = '{0}\{1}' -f $_.Org, $_.SpawnedFrom.sessionId
+            $sourceSessionIds.Contains($parentKey)
+        }).Count
+
         $dstRoot = Join-Path $SessionsRoot $dstAccount
         $plans = @()
         $already = 0
@@ -319,6 +331,8 @@ switch ($Command) {
         Write-Host "  Source index entries : $($srcRecs.Count)"
         Write-Host "  Newly copied         : $($plans.Count)"
         Write-Host "  Already identical    : $already"
+        Write-Host "  Side-session indexes : $($sideSessionRecs.Count)"
+        Write-Host "  Side-session parents : $resolvedSideSessionParents/$($sideSessionParentLinks.Count) resolved"
         Write-Host "  Missing transcripts  : $missingTranscript"
         Write-Host "  Target account       : $dstAccount"
         Write-Host "  Original indexes and shared transcript files were not changed." -ForegroundColor Green
