@@ -16,6 +16,7 @@ doesn't reach it.
 
 - **Switch accounts in ~1 second**, no re-login
 - **Move a conversation between accounts** and continue it where you left off
+- **Copy all session entries** to another account from the Sessions tab
 - **Watch for rate limits** and fail over automatically when one is exhausted
 - **A GUI**, so none of this needs a terminal
 
@@ -30,13 +31,14 @@ doesn't reach it.
 
 ## Install
 
-Put all five files in one folder, e.g. `Documents\claude-switcher`:
+Put the scripts and README in one folder, e.g. `Documents\claude-switcher`:
 
 ```
 claude-switcher-gui.ps1     the GUI
 claude-profile.ps1          account switching
 claude-sessions.ps1         moving conversations
 claude-autoswitch.ps1       rate-limit watcher
+claude-switcher-gui.vbs     optional launcher without a visible console
 README.md
 ```
 
@@ -97,11 +99,43 @@ Anthropic's artwork, so generate it locally rather than committing it.
 
 1. Open the GUI while signed into your **first** account
 2. **Accounts** tab → *Save current as…* → name it (e.g. `personal`)
-3. *Set label…* → your email, so you can tell them apart
+3. *Set label…* → a recognizable local name (e.g. `personal` or `work`)
 4. *Add account…* → follow the prompts: it opens Claude, you log out and sign in
    as the second account, then it saves that one too
 
 After that, **double-click an account to switch to it**.
+
+Labels are user-managed and do not prove which email a profile belongs to.
+Use the saved UUID shown by the switcher to distinguish profiles, and confirm
+the intended profile before copying sessions.
+
+To start the GUI without leaving a PowerShell console window open, double-click
+`claude-switcher-gui.vbs` from the folder containing the scripts. If you launch
+`claude-switcher-gui.ps1` directly in a visible PowerShell window, keep that
+PowerShell window open while the GUI is running; closing it also terminates the
+GUI. The `.vbs` launcher starts the same script with its console hidden.
+
+## Copy sessions between accounts
+
+Open the **Sessions** tab and choose the source profile. Use **Copy to other
+account** for one selected entry, or **Copy all to other account** to add every
+session index to the other saved profile. Originals and transcript files are
+left untouched; existing identical entries are skipped, while conflicting
+destination entries stop the bulk copy before it starts. The target must have a
+matching organization folder.
+
+The session list reads Claude's per-account JSON indexes. Some Claude versions
+write empty property names that Windows PowerShell 5.1 cannot parse natively; the
+switcher normalizes those names in memory without rewriting the source indexes.
+Entries marked **MISSING** have no matching local transcript, so copying their
+index does not recover the conversation.
+
+Copy confirmations identify the source and target by saved profile name, the
+user-managed label, and account UUID. A saved email field may be stale after
+signing out or switching only the Chat/Cowork side; the UUID in the profile's
+`config.json` is the account identity used by the tool. The switcher cannot
+independently verify which email address belongs to a UUID, so confirm the
+target profile before copying.
 
 ## Auto-switching (optional)
 
@@ -346,6 +380,7 @@ The GUI covers everything, but each script runs standalone:
 .\claude-sessions.ps1 accounts
 .\claude-sessions.ps1 list <account>
 .\claude-sessions.ps1 copy <sessionId> <account>
+.\claude-sessions.ps1 copy-all <sourceAccount> <targetAccount>
 
 .\claude-autoswitch.ps1 status|test|selftest|reset
 .\claude-autoswitch.ps1 warm-status|warm-login <profile>|warm-now <profile>

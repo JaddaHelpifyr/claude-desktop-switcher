@@ -278,16 +278,26 @@ function Test-FileUnlocked {
     } catch { return $false }
 }
 
+function Get-ClaudeDesktopProcesses {
+    $pkg = Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $pkg -or -not $pkg.InstallLocation) { return @() }
+    $desktopExe = [System.IO.Path]::GetFullPath((Join-Path $pkg.InstallLocation 'app\claude.exe'))
+    Get-Process -Name 'claude' -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and [System.IO.Path]::GetFullPath($_.Path).Equals(
+            $desktopExe, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+}
+
 function Stop-ClaudeApp {
-    $procs = Get-Process -Name 'claude' -ErrorAction SilentlyContinue
-    if ($procs) {
-        Write-Host "Closing Claude ($($procs.Count) process(es))..." -ForegroundColor Yellow
+    $procs = @(Get-ClaudeDesktopProcesses)
+    if ($procs.Count -gt 0) {
+        Write-Host "Closing Claude Desktop ($($procs.Count) process(es))..." -ForegroundColor Yellow
         $procs | Stop-Process -Force -ErrorAction SilentlyContinue
     }
 
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 300
-        if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue) { continue }
+        if (@(Get-ClaudeDesktopProcesses).Count -gt 0) { continue }
         # Processes gone is not enough -- Electron flushes LevelDB and SQLite on
         # exit and file handles drain a moment later. Copying the cookie DB
         # mid-flush yields a profile that silently fails to authenticate, so
@@ -295,8 +305,8 @@ function Stop-ClaudeApp {
         if (Test-FileUnlocked $CookieDb) { return }
     }
 
-    if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue) {
-        throw "Claude processes did not exit. Close the app manually and retry."
+    if (@(Get-ClaudeDesktopProcesses).Count -gt 0) {
+        throw "Claude Desktop processes did not exit. Close the app manually and retry."
     }
     throw "Claude exited but '$CookieDb' is still locked. Wait a few seconds and retry."
 }

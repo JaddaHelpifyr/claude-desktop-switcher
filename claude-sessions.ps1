@@ -19,6 +19,7 @@
       .\claude-sessions.ps1 accounts
       .\claude-sessions.ps1 list <account>
       .\claude-sessions.ps1 copy <sessionId> <targetAccount>
+      .\claude-sessions.ps1 copy-all <sourceAccount> <targetAccount>
 
     <account> accepts a profile name from claude-profile.ps1 (resolved via that
     profile's stored config.json, NOT its display label, which is unreliable)
@@ -28,7 +29,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('accounts', 'list', 'copy')]
+    [ValidateSet('accounts', 'list', 'copy', 'copy-all')]
     [string]$Command = 'accounts',
 
     [Parameter(Position = 1)]
@@ -67,6 +68,15 @@ $SessionsRoot = Join-Path $AppRoot 'claude-code-sessions'
 $ProjectsRoot = Join-Path $env:USERPROFILE '.claude\projects'
 $Store        = Join-Path $env:USERPROFILE '.claude-profiles'
 
+function ConvertFrom-ClaudeJson {
+    param([string]$Json)
+
+    # Windows PowerShell 5.1 rejects empty JSON property names found in some
+    # Claude session indexes. Rename only those keys in memory before parsing.
+    $safeJson = [regex]::Replace($Json, '(?<=[{,])\s*""(?=\s*:)', '"__claude_empty_property__"')
+    return ConvertFrom-Json -InputObject $safeJson -ErrorAction Stop
+}
+
 # Index of every transcript on disk: cliSessionId -> project folder. This is the
 # shared tree, so it is identical no matter which account is signed in.
 function Get-TranscriptIndex {
@@ -79,7 +89,7 @@ function Get-TranscriptIndex {
 }
 
 function Get-SessionRecords {
-    param([string]$AccountUuid)
+    param([string]$AccountUuid, [switch]$FailOnInvalid)
 
     $acctDir = Join-Path $SessionsRoot $AccountUuid
     if (-not (Test-Path $acctDir)) { return @() }
@@ -87,13 +97,18 @@ function Get-SessionRecords {
     $out = @()
     foreach ($orgDir in Get-ChildItem $acctDir -Directory -ErrorAction SilentlyContinue) {
         foreach ($f in Get-ChildItem $orgDir.FullName -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
-            try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+            try { $j = ConvertFrom-ClaudeJson ([IO.File]::ReadAllText($f.FullName)) }
+            catch {
+                if ($FailOnInvalid) { throw "Cannot read session index '$($f.FullName)': $($_.Exception.Message)" }
+                continue
+            }
             $out += [pscustomobject]@{
                 SessionId = $j.sessionId
                 CliId     = $j.cliSessionId
                 Title     = $j.title
                 Cwd       = $j.cwd
                 LastAt    = $j.lastActivityAt
+                SpawnedFrom = $j.spawnedFrom
                 Org       = $orgDir.Name
                 Path      = $f.FullName
             }
@@ -194,7 +209,7 @@ switch ($Command) {
 
         foreach ($r in $recs) {
             $has = '  '
-            if (-not $tx.ContainsKey($r.CliId)) { $has = ' !' }
+            if (-not $r.CliId -or -not $tx.ContainsKey([string]$r.CliId)) { $has = ' !' }
             $title = $r.Title
             if (-not $title) { $title = '<untitled>' }
             if ($title.Length -gt 44) { $title = $title.Substring(0, 41) + '...' }
@@ -220,18 +235,20 @@ switch ($Command) {
         $dstAccount = Resolve-Account $Arg2
         if ($dstAccount -eq $srcAccount) { throw "Session is already under account $dstAccount." }
 
-        # Target org: the one that already holds that account's sessions.
+        # Prefer the same organization folder as the source session when it
+        # already exists for the target account.
         $dstRecs = Get-SessionRecords -AccountUuid $dstAccount
-        $dstOrg = $null
-        if ($dstRecs) { $dstOrg = ($dstRecs | Group-Object Org | Sort-Object Count -Descending | Select-Object -First 1).Name }
+        $dstRoot = Join-Path $SessionsRoot $dstAccount
+        $dstOrg = if (Test-Path (Join-Path $dstRoot $src.Org)) { $src.Org } else { $null }
+        if (-not $dstOrg -and $dstRecs) { $dstOrg = ($dstRecs | Group-Object Org | Sort-Object Count -Descending | Select-Object -First 1).Name }
         if (-not $dstOrg) {
-            $dirs = @(Get-ChildItem (Join-Path $SessionsRoot $dstAccount) -Directory -ErrorAction SilentlyContinue)
+            $dirs = @(Get-ChildItem $dstRoot -Directory -ErrorAction SilentlyContinue)
             if ($dirs.Count -eq 1) { $dstOrg = $dirs[0].Name }
             else { throw "Cannot determine which org folder to use under $dstAccount. Open a session on that account first." }
         }
 
         $tx = Get-TranscriptIndex
-        if (-not $tx.ContainsKey($src.CliId)) {
+        if (-not $src.CliId -or -not $tx.ContainsKey([string]$src.CliId)) {
             Write-Warning "No transcript found for cliSessionId $($src.CliId) - the copied session may open empty."
         }
 
@@ -253,6 +270,72 @@ switch ($Command) {
         if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue) {
             Write-Host "  Restart Claude for it to show up in the session list." -ForegroundColor Yellow
         }
+        Write-Host ""
+    }
+
+    'copy-all' {
+        if (-not $Arg1 -or -not $Arg2) { throw "Usage: .\claude-sessions.ps1 copy-all <sourceAccount> <targetAccount>" }
+
+        $srcAccount = Resolve-Account $Arg1
+        $dstAccount = Resolve-Account $Arg2
+        if ($dstAccount -eq $srcAccount) { throw 'Source and target accounts are the same.' }
+
+        $srcRecs = @(Get-SessionRecords -AccountUuid $srcAccount -FailOnInvalid)
+        if (-not $srcRecs) { throw "No session indexes found under source account $srcAccount." }
+
+        $sideSessionRecs = @($srcRecs | Where-Object { $_.SpawnedFrom -and $_.SpawnedFrom.sideSession -eq $true })
+        $sourceSessionIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($record in $srcRecs) {
+            if ($record.SessionId) { [void]$sourceSessionIds.Add(('{0}\{1}' -f $record.Org, $record.SessionId)) }
+        }
+        $sideSessionParentLinks = @($sideSessionRecs | Where-Object { $_.SpawnedFrom.sessionId })
+        $resolvedSideSessionParents = @($sideSessionParentLinks | Where-Object {
+            $parentKey = '{0}\{1}' -f $_.Org, $_.SpawnedFrom.sessionId
+            $sourceSessionIds.Contains($parentKey)
+        }).Count
+
+        $dstRoot = Join-Path $SessionsRoot $dstAccount
+        $plans = @()
+        $already = 0
+        $conflicts = @()
+        foreach ($r in $srcRecs) {
+            $dstDir = Join-Path $dstRoot $r.Org
+            if (-not (Test-Path $dstDir)) {
+                throw "Target account has no matching organization folder '$($r.Org)'; no sessions were copied."
+            }
+
+            $dstFile = Join-Path $dstDir (Split-Path $r.Path -Leaf)
+            if (Test-Path $dstFile) {
+                $srcHash = (Get-FileHash -LiteralPath $r.Path -Algorithm SHA256).Hash
+                $dstHash = (Get-FileHash -LiteralPath $dstFile -Algorithm SHA256).Hash
+                if ($srcHash -ne $dstHash) { $conflicts += $dstFile }
+                else { $already++ }
+                continue
+            }
+            $plans += [pscustomobject]@{ Source = $r.Path; Destination = $dstFile; Hash = (Get-FileHash -LiteralPath $r.Path -Algorithm SHA256).Hash }
+        }
+
+        if ($conflicts.Count -gt 0) {
+            throw "Found $($conflicts.Count) different destination index file(s); no sessions were copied. Resolve the conflicts first."
+        }
+
+        $tx = Get-TranscriptIndex
+        $missingTranscript = @($srcRecs | Where-Object { -not $_.CliId -or -not $tx.ContainsKey([string]$_.CliId) }).Count
+        foreach ($plan in $plans) {
+            Copy-Item -LiteralPath $plan.Source -Destination $plan.Destination -ErrorAction Stop
+            $copiedHash = (Get-FileHash -LiteralPath $plan.Destination -Algorithm SHA256).Hash
+            if ($copiedHash -ne $plan.Hash) { throw "Copied index failed SHA256 readback: $($plan.Destination)" }
+        }
+
+        Write-Host ""
+        Write-Host "  Source index entries : $($srcRecs.Count)"
+        Write-Host "  Newly copied         : $($plans.Count)"
+        Write-Host "  Already identical    : $already"
+        Write-Host "  Side-session indexes : $($sideSessionRecs.Count)"
+        Write-Host "  Side-session parents : $resolvedSideSessionParents/$($sideSessionParentLinks.Count) resolved"
+        Write-Host "  Missing transcripts  : $missingTranscript"
+        Write-Host "  Target account       : $dstAccount"
+        Write-Host "  Original indexes and shared transcript files were not changed." -ForegroundColor Green
         Write-Host ""
     }
 }

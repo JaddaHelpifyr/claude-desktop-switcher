@@ -105,7 +105,7 @@ function Get-Profiles {
         foreach ($i in $items) { if (-not (Test-Path (Join-Path $p.FullName $i))) { $complete = $false } }
         $label = Read-Trimmed (Join-Path $p.FullName 'label.txt')
         if (-not $label) { $label = '<unlabeled>' }
-        $out += [pscustomobject]@{ Name = $p.Name; Label = $label; Uuid = $uuid; Complete = $complete }
+        $out += [pscustomobject]@{ Name = $p.Name; Label = $label; Display = $label; ShortUuid = (Get-ShortUuid $uuid); Uuid = $uuid; Complete = $complete }
     }
     return $out
 }
@@ -118,7 +118,13 @@ function Get-SessionsFor {
     if (-not (Test-Path $dir)) { return $out }
     foreach ($org in Get-ChildItem $dir -Directory -ErrorAction SilentlyContinue) {
         foreach ($f in Get-ChildItem $org.FullName -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
-            try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+            try {
+                $raw = [IO.File]::ReadAllText($f.FullName)
+                # Windows PowerShell 5.1 rejects empty JSON property names in
+                # some Claude indexes; rename only those keys in memory.
+                $safeJson = [regex]::Replace($raw, '(?<=[{,])\s*""(?=\s*:)', '"__claude_empty_property__"')
+                $j = ConvertFrom-Json -InputObject $safeJson -ErrorAction Stop
+            } catch { continue }
             $out += [pscustomobject]@{
                 SessionId = $j.sessionId
                 CliId     = $j.cliSessionId
@@ -170,6 +176,16 @@ function Get-ShortUuid {
     if (-not $U) { return '<unknown>' }
     if ($U.Length -le 8) { return $U }
     return $U.Substring(0,8) + '...'
+}
+
+function Format-ProfileDisplay {
+    param($Profile)
+    return "$($Profile.Name) - $($Profile.Display) [$($Profile.ShortUuid)]"
+}
+
+function Format-ProfileIdentity {
+    param($Profile)
+    return "Profile: $($Profile.Name)`nLabel: $($Profile.Display)`nClaude Code UUID: $($Profile.Uuid)"
 }
 
 # --- Form scaffolding --------------------------------------------------------
@@ -278,7 +294,7 @@ $lvProfiles.View      = 'Details'
 $lvProfiles.FullRowSelect = $true
 $lvProfiles.MultiSelect   = $false
 $lvProfiles.GridLines     = $true
-$lvProfiles.Anchor        = 'Top,Bottom,Left,Right'
+$lvProfiles.Anchor        = 'Top,Bottom,Left'
 [void]$lvProfiles.Columns.Add('', 28)
 [void]$lvProfiles.Columns.Add('Profile', 110)
 [void]$lvProfiles.Columns.Add('Account', 220)
@@ -289,7 +305,7 @@ $tabProfiles.Controls.Add($lvProfiles)
 $lblProfHint          = New-Object System.Windows.Forms.Label
 $lblProfHint.Location = New-Object System.Drawing.Point(662, 284)
 $lblProfHint.Size     = New-Object System.Drawing.Size(214, 60)
-$lblProfHint.Anchor   = 'Top,Right'
+$lblProfHint.Anchor   = 'Top,Left'
 $lblProfHint.ForeColor = [System.Drawing.Color]::DimGray
 $lblProfHint.Text     = "Double-click an account to switch to it.`r`n`r`nSwitching closes and reopens Claude."
 $tabProfiles.Controls.Add($lblProfHint)
@@ -309,10 +325,11 @@ foreach ($b in $profButtons) {
     $btn.Text = $b.Text
     $btn.Location = New-Object System.Drawing.Point(662, $b.Y)
     $btn.Size = New-Object System.Drawing.Size(214, 30)
-    $btn.Anchor = 'Top,Right'
+    $btn.Anchor = 'Top,Left'
     $tabProfiles.Controls.Add($btn)
     $profBtn[$b.Name] = $btn
 }
+$lvProfiles.SendToBack()
 
 # =============================== Tab: Sessions ===============================
 
@@ -339,7 +356,7 @@ $lvSessions.View      = 'Details'
 $lvSessions.FullRowSelect = $true
 $lvSessions.MultiSelect   = $false
 $lvSessions.GridLines     = $true
-$lvSessions.Anchor        = 'Top,Bottom,Left,Right'
+$lvSessions.Anchor        = 'Top,Bottom,Left'
 [void]$lvSessions.Columns.Add('Last active', 100)
 [void]$lvSessions.Columns.Add('Title', 300)
 [void]$lvSessions.Columns.Add('Transcript', 90)
@@ -350,13 +367,20 @@ $btnCopySession       = New-Object System.Windows.Forms.Button
 $btnCopySession.Text  = 'Copy to other account'
 $btnCopySession.Location = New-Object System.Drawing.Point(662, 46)
 $btnCopySession.Size  = New-Object System.Drawing.Size(214, 30)
-$btnCopySession.Anchor = 'Top,Right'
+$btnCopySession.Anchor = 'Top,Left'
 $tabSessions.Controls.Add($btnCopySession)
 
+$btnCopyAll                 = New-Object System.Windows.Forms.Button
+$btnCopyAll.Text            = 'Copy all to other account'
+$btnCopyAll.Location        = New-Object System.Drawing.Point(662, 84)
+$btnCopyAll.Size            = New-Object System.Drawing.Size(214, 30)
+$btnCopyAll.Anchor          = 'Top,Left'
+$tabSessions.Controls.Add($btnCopyAll)
+
 $lblSessHint          = New-Object System.Windows.Forms.Label
-$lblSessHint.Location = New-Object System.Drawing.Point(662, 84)
+$lblSessHint.Location = New-Object System.Drawing.Point(662, 122)
 $lblSessHint.Size     = New-Object System.Drawing.Size(214, 150)
-$lblSessHint.Anchor   = 'Top,Right'
+$lblSessHint.Anchor   = 'Top,Left'
 $lblSessHint.ForeColor = [System.Drawing.Color]::DimGray
 $lblSessHint.Text     = "Transcripts are shared between accounts - copying only adds the session to the other account's list. The original stays put.`r`n`r`nRestart Claude for a copied session to appear."
 $tabSessions.Controls.Add($lblSessHint)
@@ -562,7 +586,7 @@ function Update-All {
     foreach ($p in $script:Profiles) { if ($p.Uuid -eq $live) { $liveProf = $p } }
 
     if ($liveProf) {
-        $header.Text = "Signed in: $($liveProf.Label)   ($($liveProf.Name))"
+        $header.Text = "Signed in: $(Format-ProfileDisplay $liveProf)"
     } elseif ($live) {
         $header.Text = "Signed in: $(Get-ShortUuid $live)   (no matching profile)"
     } else {
@@ -577,7 +601,7 @@ function Update-All {
         if (-not $p.Complete) { $state = 'INCOMPLETE' }
         $it = New-Object System.Windows.Forms.ListViewItem($mark)
         [void]$it.SubItems.Add($p.Name)
-        [void]$it.SubItems.Add($p.Label)
+        [void]$it.SubItems.Add($p.Display)
         [void]$it.SubItems.Add((Get-ShortUuid $p.Uuid))
         [void]$it.SubItems.Add($state)
         $it.Tag = $p
@@ -589,7 +613,7 @@ function Update-All {
     # Sessions tab account list
     $sel = $cbAccount.SelectedIndex
     $cbAccount.Items.Clear()
-    foreach ($p in $script:Profiles) { [void]$cbAccount.Items.Add("$($p.Name)  -  $($p.Label)") }
+    foreach ($p in $script:Profiles) { [void]$cbAccount.Items.Add((Format-ProfileDisplay $p)) }
     if ($cbAccount.Items.Count -gt 0) {
         if ($sel -ge 0 -and $sel -lt $cbAccount.Items.Count) { $cbAccount.SelectedIndex = $sel }
         else { $cbAccount.SelectedIndex = 0 }
@@ -637,7 +661,7 @@ function Update-All {
             foreach ($pr in $cd.PSObject.Properties) {
                 if ([int64]$pr.Value -gt $now) {
                     $nm = (Get-ShortUuid $pr.Name)
-                    foreach ($p in $script:Profiles) { if ($p.Uuid -eq $pr.Name) { $nm = $p.Label } }
+                    foreach ($p in $script:Profiles) { if ($p.Uuid -eq $pr.Name) { $nm = $p.Display } }
                     $lines += "$nm  limited until $(Format-Epoch $pr.Value -Seconds)"
                 }
             }
@@ -825,11 +849,11 @@ function Invoke-SwitchToSelected {
         return
     }
     if ($p.Uuid -eq (Get-LiveUuid)) {
-        [void][System.Windows.Forms.MessageBox]::Show("Already signed in as $($p.Label).", 'Claude Switcher', 'OK', 'Information')
+        [void][System.Windows.Forms.MessageBox]::Show("Already signed in as $($p.Display).", 'Claude Switcher', 'OK', 'Information')
         return
     }
     $r = [System.Windows.Forms.MessageBox]::Show(
-        "Switch to '$($p.Name)' ($($p.Label))?`n`nThis closes Claude and reopens it.",
+        "Switch to '$($p.Name)' ($($p.Display))?`n`nThis closes Claude and reopens it.",
         'Claude Switcher', 'YesNo', 'Question')
     if ($r -ne 'Yes') { return }
     Invoke-Tool $ProfileScript @('switch', $p.Name)
@@ -924,7 +948,7 @@ $profBtn['delete'].Add_Click({
     $p = Get-SelectedProfile
     if (-not $p) { return }
     $r = [System.Windows.Forms.MessageBox]::Show(
-        "Delete profile '$($p.Name)'?`n`nThe saved session for $($p.Label) is removed. You would have to sign into that account again to recreate it.",
+        "Delete profile '$($p.Name)'?`n`nThe saved session for $($p.Display) is removed. You would have to sign into that account again to recreate it.",
         'Claude Switcher', 'YesNo', 'Warning')
     if ($r -ne 'Yes') { return }
     Invoke-Tool $ProfileScript @('delete', $p.Name)
@@ -949,10 +973,40 @@ $btnCopySession.Add_Click({
     if (-not $dst) { return }
 
     $r = [System.Windows.Forms.MessageBox]::Show(
-        "Copy `"$($s.Title)`" to $($dst.Label)?`n`nThe original stays on $($src.Label). Restart Claude to see it.",
+        "Copy `"$($s.Title)`"?`n`nSOURCE`n$(Format-ProfileIdentity $src)`n`nTARGET`n$(Format-ProfileIdentity $dst)`n`nLabels are user-managed; the saved profile does not verify the account email. Confirm the target UUID is the intended account. The original stays unchanged. Restart Claude to see it.",
         'Claude Switcher', 'YesNo', 'Question')
     if ($r -ne 'Yes') { return }
     Invoke-Tool $SessionScript @('copy', $s.SessionId, $dst.Name)
+    Update-Sessions
+})
+
+$btnCopyAll.Add_Click({
+    if ($cbAccount.SelectedIndex -lt 0) {
+        [void][System.Windows.Forms.MessageBox]::Show('Select a source account first.', 'Claude Switcher', 'OK', 'Information')
+        return
+    }
+    if ($script:Profiles.Count -lt 2) {
+        [void][System.Windows.Forms.MessageBox]::Show('You need two saved profiles to copy sessions between accounts.', 'Claude Switcher', 'OK', 'Information')
+        return
+    }
+
+    $src = $script:Profiles[$cbAccount.SelectedIndex]
+    $dst = $null
+    foreach ($p in $script:Profiles) { if ($p.Name -ne $src.Name) { $dst = $p; break } }
+    if (-not $dst) { return }
+
+    $count = $lvSessions.Items.Count
+    if ($count -eq 0) {
+        [void][System.Windows.Forms.MessageBox]::Show('There are no sessions to copy for this account.', 'Claude Switcher', 'OK', 'Information')
+        return
+    }
+    $missing = 0
+    foreach ($item in $lvSessions.Items) { if ($item.SubItems[2].Text -eq 'MISSING') { $missing++ } }
+    $message = "Copy all $count session index entries?`n`nSOURCE`n$(Format-ProfileIdentity $src)`n`nTARGET`n$(Format-ProfileIdentity $dst)`n`nThe saved profile does not verify the account email; labels are user-managed. Confirm the target UUID is the intended account.`n`n$missing entries have no local transcript, so copying their index will not restore their conversation.`n`nOriginals stay untouched; existing identical entries are skipped."
+    $r = [System.Windows.Forms.MessageBox]::Show($message, 'Claude Switcher', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    Invoke-Tool $SessionScript @('copy-all', $src.Name, $dst.Name)
     Update-Sessions
 })
 
@@ -1038,6 +1092,7 @@ $tip.SetToolTip($lvProfiles,        'Double-click an account to switch to it. Th
 
 $tip.SetToolTip($cbAccount,      "Choose which account's session list to show.")
 $tip.SetToolTip($btnCopySession, "Add the selected conversation to the other account's list.`nThe original stays put - both accounts read the same transcript file.`nRestart Claude to see it appear.")
+$tip.SetToolTip($btnCopyAll, "Copy every session index for the selected account to the other profile.`nOriginal indexes and transcripts stay unchanged; identical entries are skipped.")
 $tip.SetToolTip($lvSessions,     "Sessions belonging to the chosen account. 'MISSING' means the transcript file is gone, so copying it would open empty.")
 
 $tip.SetToolTip($chkDryRun,   'Detect and log rate limits but never actually switch. Leave this on until you have seen it fire correctly once.')
@@ -1095,7 +1150,7 @@ $refreshTimer.Add_Tick({
             Update-All          # this also re-baselines LastSeen*
             if ($u -ne $wasUuid) {
                 $who = $null
-                foreach ($p in $script:Profiles) { if ($p.Uuid -eq $u) { $who = $p.Label } }
+                foreach ($p in $script:Profiles) { if ($p.Uuid -eq $u) { $who = $p.Display } }
                 if (-not $who) { $who = Get-ShortUuid $u }
                 Add-Output "Account changed outside this window - now on $who."
             } else {
