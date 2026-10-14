@@ -1082,10 +1082,13 @@ Update-All
 # signals - the live account UUID and the watcher mutex - and do a full refresh
 # only when one of them actually changed. A full Update-All every few seconds
 # would re-enumerate every transcript, which is far too heavy.
+. (Join-Path $PSScriptRoot 'claude-switcher-timer.ps1')
 $script:Busy = $false
 $refreshTimer          = New-Object System.Windows.Forms.Timer
 $refreshTimer.Interval = 3000
-$refreshTimer.Add_Tick({
+$refreshTimerState     = @{ Stopped = $false }
+$refreshTickHandler    = {
+    if ($refreshTimerState.Stopped) { return }
     if ($script:Busy) { return }
     try {
         $u = Get-LiveUuid
@@ -1103,10 +1106,14 @@ $refreshTimer.Add_Tick({
             }
         }
     } catch { }   # never let a transient read kill the timer
-})
+}
+$refreshTimer.Add_Tick($refreshTickHandler)
+$form.Add_FormClosing({ Stop-SwitcherRefreshTimer -Timer $refreshTimer -Handler $refreshTickHandler -State $refreshTimerState })
 $refreshTimer.Start()
 
 Add-Output 'Ready. Switching and saving both close Claude briefly.'
-[void]$form.ShowDialog()
-$refreshTimer.Stop()
-$refreshTimer.Dispose()
+try {
+    [void]$form.ShowDialog()
+} finally {
+    Stop-SwitcherRefreshTimer -Timer $refreshTimer -Handler $refreshTickHandler -State $refreshTimerState
+}
